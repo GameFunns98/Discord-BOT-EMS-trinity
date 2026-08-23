@@ -1,0 +1,14 @@
+[Unit]
+Description=Discord Ticket Renamer stable release updater
+Documentation=https://github.com/GameFunns98/Discord-BOT-EMS-trinity
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 %h/.local/lib/discord-ticket-renamer/updater.py update
+RuntimeDirectory=discord-ticket-renamer
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes

@@ -1,4 +1,4 @@
-# Discord Ticket Renamer 2.4
+# Discord Ticket Renamer 2.5.0
 
 Samostatný bot pro automatické přejmenování osobních složek zaměstnanců.
 Nový tok funguje takto:
@@ -9,6 +9,12 @@ Nový tok funguje takto:
    složku a vloží do ní embed se základními informacemi,
 4. podle pozice nabídne vedení cílovou hodnost ve FiveRosteru,
 5. po potvrzeném nástupu vloží a připne zaměstnanci osobní služební panel.
+
+Pokud odkaz na `zadost-*` chybí nebo není použitelný, bot místo tichého
+ukončení vloží do osobní složky ovládání **Doplnit údaje**. Člen vedení v něm
+vybere zaměstnance a pozici a doplní jméno, datum narození a telefon. Takto
+uložené údaje se následně používají jako autoritativní zdroj a pozdější změna
+odkazu na žádost je sama nepřepíše.
 
 Kanál `zadost-*` bot nikdy nepřejmenuje. Z formuláře pro název používá pouze:
 
@@ -80,6 +86,27 @@ Command smí použít pouze role vedení nastavená v
 panel neduplikuje a u ručně založeného panelu uvede člena vedení, který příkaz
 spustil. Zprávu vždy odesílá bot; Discord nepovoluje vydávat ji za osobní účet.
 
+## Ruční doplnění žádosti
+
+Obnovovací formulář bot založí pouze u rozpoznaného Ticket Tool formuláře v
+povolené kategorii osobních složek. Tlačítko může použít výhradně role vedení;
+oprávnění Administrátor tuto kontrolu neobchází. Vedení postupně vybere:
+
+1. Discord zaměstnance,
+2. pozici `Záchranář`, `Doktor` nebo `Ochranka`,
+3. jméno a příjmení, datum narození a telefonní číslo.
+
+Po odeslání bot pokračuje stejným přejmenováním, informačním embedem,
+FiveRoster nástupem a služebním panelem jako u běžné žádosti. Stejný obnovovací
+panel se nevytvoří dvakrát a po restartu zůstává funkční. Pro již existující
+osobní složku jej může vedení založit příkazem:
+
+```text
+/doplnit-zadost
+```
+
+Příkaz funguje jen přímo v povolené osobní složce, nikdy v `zadost-*`.
+
 Windows verze běží tiše na pozadí jako ikona v oznamovací oblasti u hodin.
 Zobrazuje oznámení při přejmenování osobní složky, ztrátě spojení, chybě oprávnění,
 neplatném tokenu a dalších důležitých událostech. Podrobný průběh zapisuje do
@@ -88,6 +115,58 @@ neplatném tokenu a dalších důležitých událostech. Podrobný průběh zapi
 > Aplikace se automaticky spouští po přihlášení do Windows. Nejde o systémovou
 > službu, protože služby nemohou zobrazovat tray ikonu v uživatelské relaci.
 > Při vypnutém počítači bot neběží; pro to je potřeba externí server.
+
+## Arch Linux a automatické aktualizace
+
+Na Arch Linuxu se bot instaluje jako uživatelská systemd služba. Konfigurace se
+oddělí od vydaného programu a zůstane v:
+
+```text
+~/.config/discord-ticket-renamer/.env
+```
+
+První instalace ze staženého stabilního GitHub Release se provede z kořene
+projektu:
+
+```bash
+chmod +x linux/install.sh
+./linux/install.sh
+```
+
+Instalátor zachová nalezený `.env`, před případnou migrací jej zazálohuje a
+zapne dvě oddělené služby: samotného bota a aktualizátor. Pro běh bez přihlášení
+je jednorázově potřeba zapnout lingering pro daného uživatele:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+Aktualizátor každých deset minut zkontroluje nejnovější stabilní GitHub Release.
+Novou verzi stáhne a otestuje vedle běžící verze. Bota zastaví teprve při
+atomickém přepnutí; pokud se nová verze do 60 sekund nepřipojí k Discordu, vrátí
+automaticky předchozí funkční vydání. Síťová chyba, poškozený archiv ani chyba
+instalace aktuálně běžícího bota nevypne. `.env` není součástí release archivu a
+aktualizátor jej nikdy nepřepisuje.
+
+Přehledné ovládání poskytují příkazy:
+
+```bash
+ticket-renamer status
+ticket-renamer logs
+ticket-renamer doctor
+ticket-renamer restart
+ticket-renamer update-now
+ticket-renamer version
+```
+
+`logs` sleduje stručný systemd journal. Interaktivní terminál používá barvy,
+journal ukládá stejný text bez řídicích znaků. `doctor` také upozorní na staré
+`TicketRenamer.log*` v původním adresáři, protože dřívější DEBUG logy mohou
+obsahovat citlivé údaje; nikdy je automaticky nemaže.
+
+O dostupné verzi rozhoduje stabilní GitHub Release tag a přiložený
+`release-manifest.json`. Verze uvedená v tomto README se při sestavení musí
+shodovat s tagem i metadaty balíčku, sama ale aktualizaci neřídí.
 
 ## 1. Nastavení bota na Discordu
 
@@ -221,6 +300,11 @@ dokončený onboarding marker. Zaměstnance nikdy neodhaduje podle názvu kanál
 - Stejný název neposílá Discordu opakovaně.
 - Token zůstává v místním `.env` a nevypisuje se do logu ani embedu.
 - Stejně je chráněný FiveRoster API klíč; vydaný ZIP žádný `.env` neobsahuje.
+- Discord HTTP a gateway loggery jsou i při ladění omezené minimálně na
+  `WARNING`. Autorizační hlavičky, bot tokeny, webhookové tokeny a známé tajné
+  hodnoty procházejí redakčním filtrem.
+- Embed payloady, datum narození, telefonní číslo a důvod LOA se do lokálních
+  logů nezapisují.
 - Nástupové tlačítko vyžaduje přesně nakonfigurovanou roli vedení. Administrátor
   bez této role nemá výjimku.
 - Ruční `/sluzebni-panel` používá stejnou kontrolu role a funguje jen v povolené
@@ -233,8 +317,10 @@ dokončený onboarding marker. Zaměstnance nikdy neodhaduje podle názvu kanál
   složky, ale nevypisují se do lokálního logu.
 - Embed obsahující osobní údaje může číst každý, kdo má přístup k osobní
   složce; oprávnění této kategorie proto udržujte omezená.
-- Pro kontrolu změn log obsahuje původní a nový název kanálu, tedy i jméno
-  použité v názvu osobní složky. Log se automaticky rotuje (nejvýše 4 soubory).
+- Pro kontrolu změn log používá typ provedené operace bez jména zaměstnance.
+  Discord ID, interaction tokeny a další stabilní identifikátory redakční filtr
+  nahradí zástupnou hodnotou. Windows log se automaticky rotuje (nejvýše
+  4 soubory), Linux používá systemd journal.
 - Běžet může jen jedna instance tray aplikace.
 
 ## Vývojářské testy
@@ -243,4 +329,11 @@ Tato část je potřeba jen při úpravě zdrojového kódu a vyžaduje Python:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Kontrola instalace bez připojení živého bota:
+
+```text
+ticket-renamer self-test
+ticket-renamer doctor
 ```

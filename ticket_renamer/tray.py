@@ -15,6 +15,12 @@ from . import autostart
 from .config import Settings
 from .controller import BotController
 from .events import AppEvent, EventLevel
+from .logging_config import (
+    ConciseFormatter,
+    SensitiveDataFilter,
+    clamp_third_party_loggers,
+    secret_values_from_environment,
+)
 from .paths import application_directory
 
 
@@ -42,12 +48,11 @@ def configure_file_logging(settings: Settings) -> Path:
             encoding="utf-8",
         )
         handler.ticket_renamer_handler = True  # type: ignore[attr-defined]
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-            )
-        )
+        handler.addFilter(SensitiveDataFilter(secret_values_from_environment()))
+        handler.setFormatter(ConciseFormatter(use_color=False))
         root_logger.addHandler(handler)
+
+    clamp_third_party_loggers()
 
     return log_path
 
@@ -120,7 +125,15 @@ class TrayApplication:
             EventLevel.WARNING: logging.WARNING,
             EventLevel.ERROR: logging.ERROR,
         }
-        LOGGER.log(level_to_log[event.level], "%s: %s", event.title, event.message)
+        # Detail může obsahovat jméno zaměstnance nebo název osobní složky.
+        # Uživatel jej uvidí v oznámení, do trvalého logu ale patří jen typ
+        # události a technický stav.
+        LOGGER.log(
+            level_to_log[event.level],
+            "%s (stav: %s)",
+            event.title,
+            event.status or "beze změny",
+        )
 
         with self._state_lock:
             if event.status:

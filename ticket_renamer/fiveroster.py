@@ -100,16 +100,10 @@ def _normalized_name(value: str) -> str:
 
 
 def _error_message(payload: Any, status: int) -> str:
-    message = ""
-    if isinstance(payload, Mapping):
-        error = payload.get("error")
-        if isinstance(error, Mapping):
-            message = str(error.get("message") or "")
-        if not message:
-            message = str(payload.get("message") or "")
-    message = re.sub(r"\s+", " ", message).strip()
-    if message:
-        return f"FiveRoster vrátil HTTP {status}: {message[:300]}"
+    # API messages can echo a player's name, LOA reason, request body or another
+    # personal value.  Keep the actionable HTTP status, but never persist the
+    # remote response text in Discord replies, tray notifications or logs.
+    del payload
     return f"FiveRoster vrátil HTTP {status}."
 
 
@@ -377,9 +371,7 @@ class FiveRosterClient:
         expected_id = str(member_id).strip()
 
         LOGGER.info(
-            "FiveRoster lookup: hledam %s v rosteru %s; API vratilo %d hracu.",
-            expected_id,
-            self.roster_uuid,
+            "FiveRoster lookup byl zahájen; API vrátilo %d hráčů.",
             len(players),
         )
 
@@ -397,34 +389,13 @@ class FiveRosterClient:
             if player_id != expected_id:
                 continue
 
-            LOGGER.info(
-                "FiveRoster lookup: hrac %s nalezen; data=%s",
-                expected_id,
-                {
-                    "id": player.get("id"),
-                    "member_id": player.get("member_id"),
-                    "player_id": player.get("player_id"),
-                    "rank_uuid": player.get("rank_uuid"),
-                    "rank": player.get("rank"),
-                    "callsign": player.get("callsign"),
-                },
-            )
+            LOGGER.info("FiveRoster lookup našel odpovídajícího hráče.")
 
             return player
 
         LOGGER.warning(
-            "FiveRoster lookup: hrac %s nebyl nalezen. ID z API: %s",
-            expected_id,
-            [
-                str(
-                    player.get("id")
-                    or player.get("member_id")
-                    or player.get("player_id")
-                    or ""
-                )
-                for player in players
-                if isinstance(player, Mapping)
-            ],
+            "FiveRoster lookup nenašel odpovídajícího hráče mezi %d záznamy.",
+            len(players),
         )
 
         return None
@@ -454,11 +425,7 @@ class FiveRosterClient:
                     return rank.uuid
 
         LOGGER.warning(
-            "Hrac %s ve FiveRosteru existuje, ale nepodarilo se zjistit rank_uuid. "
-            "rank=%r rank_uuid=%r",
-            member_id,
-            player.get("rank"),
-            player.get("rank_uuid"),
+            "FiveRoster hráče našel, ale z odpovědi nelze bezpečně určit cílovou hodnost."
         )
 
         return None
@@ -627,10 +594,7 @@ class FiveRosterClient:
 
         for item in raw_requests:
             if not isinstance(item, Mapping):
-                LOGGER.warning(
-                    "FiveRoster LOA: přeskočena neplatná položka: %r",
-                    item,
-                )
+                LOGGER.warning("FiveRoster LOA: přeskočena neplatná položka.")
                 continue
 
             loa_id = _integer(item.get("id"))
@@ -643,14 +607,7 @@ class FiveRosterClient:
                 start_date = _parse_date(raw_start)
                 end_date = _parse_date(raw_end)
             except FiveRosterError:
-                LOGGER.warning(
-                    "FiveRoster LOA %s hráče %s má neplatné datum: start_date=%r end_date=%r status=%r. Položka bude přeskočena.",
-                    loa_id,
-                    player_id,
-                    raw_start,
-                    raw_end,
-                    loa_status,
-                )
+                LOGGER.warning("FiveRoster LOA má neplatné datum a bude přeskočena.")
                 continue
 
             requests.append(

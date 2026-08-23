@@ -7,6 +7,7 @@ from ticket_renamer.fiveroster import (
     FiveRosterDifferentRankError,
     FiveRosterError,
 )
+from ticket_renamer import fiveroster as fiveroster_module
 
 
 RANK_NAMES = {
@@ -42,6 +43,16 @@ class StubFiveRosterClient(FiveRosterClient):
 
 
 class FiveRosterClientTests(unittest.IsolatedAsyncioTestCase):
+    def test_api_error_does_not_expose_remote_personal_message(self) -> None:
+        message = fiveroster_module._error_message(
+            {"message": "John Example – důvod LOA: soukromá informace"},
+            422,
+        )
+
+        self.assertEqual(message, "FiveRoster vrátil HTTP 422.")
+        self.assertNotIn("John", message)
+        self.assertNotIn("soukromá", message)
+
     async def test_resolves_all_unique_non_section_ranks(self) -> None:
         client = StubFiveRosterClient([(200, ranks_payload())])
 

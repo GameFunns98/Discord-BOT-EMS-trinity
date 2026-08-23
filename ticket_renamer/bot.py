@@ -8,6 +8,7 @@ import logging
 import discord
 from discord import app_commands
 
+from . import __version__
 from .config import Settings
 from .events import AppEvent, EventLevel, EventReporter
 from .fiveroster import (
@@ -17,6 +18,24 @@ from .fiveroster import (
     FiveRosterDifferentRankError,
     FiveRosterError,
     LoaRequest,
+)
+from .health import write_health_marker
+from .logging_config import configure_logging, secret_values_from_environment
+from .manual_fallback import (
+    MANUAL_FALLBACK_HISTORY_LIMIT,
+    ManualFallbackMarker,
+    ManualFallbackRecord,
+    ManualFallbackSource,
+    ManualFallbackState,
+    ManualRecoveryAction,
+    ManualRecoveryView,
+    ManualSelectionView,
+    ManualSubmission,
+    ManualValidationError,
+    build_manual_fallback_embed,
+    is_recognizable_folder_embed,
+    parse_manual_fallback_embed,
+    validate_manual_ticket_form,
 )
 from .onboarding import (
     ALL_ACTIONS,
@@ -73,6 +92,12 @@ class OnboardingExecutionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TicketFormProcessingResult:
+    changed: bool
+    channel: discord.TextChannel
+
+
+@dataclass(frozen=True, slots=True)
 class ShiftPanelUpsertResult:
     message: discord.Message | None = None
     created: bool = False
@@ -87,6 +112,10 @@ class ShiftPanelUpsertResult:
 
 
 class ShiftPanelLookupError(RuntimeError):
+    pass
+
+
+class ManualFallbackLookupError(RuntimeError):
     pass
 
 
@@ -159,6 +188,7 @@ class TicketRenamerClient(discord.Client):
         self._initial_scan_finished = False
         self._synced_command_guild_ids: set[int] = set()
         self._closing_requested = False
+        self._health_task: asyncio.Task[None] | None = None
         self._fiveroster = fiveroster_client
         self._fiveroster_error: str | None = None
         self._fiveroster_notice_reported = False
@@ -176,9 +206,18 @@ class TicketRenamerClient(discord.Client):
         ) -> None:
             await self._handle_shift_panel_command(interaction, uzivatel)
 
+        @self.tree.command(
+            name="doplnit-zadost",
+            description="Vytvoří nebo obnoví formulář pro ruční doplnění žádosti.",
+        )
+        @app_commands.guild_only()
+        async def manual_request_command(interaction: discord.Interaction) -> None:
+            await self._handle_manual_request_command(interaction)
+
     async def setup_hook(self) -> None:
         self.add_view(OnboardingView(self._handle_onboarding_interaction, ALL_ACTIONS))
         self.add_view(ShiftPanelView(self._handle_shift_panel_interaction))
+        self.add_view(ManualRecoveryView(self._handle_manual_recovery_interaction))
 
         if not self.settings.fiveroster_enabled:
             return
@@ -237,13 +276,16 @@ class TicketRenamerClient(discord.Client):
                     AppEvent(
                         EventLevel.ERROR,
                         "Slash command se nepodařilo zapnout",
-                        "Discord nezaregistroval /sluzebni-panel. Zkontrolujte instalaci aplikace.",
+                        "Discord nezaregistroval slash commandy. Zkontrolujte instalaci aplikace.",
                         status="Připojeno – chyba commandu",
                     )
                 )
                 continue
             self._synced_command_guild_ids.add(guild.id)
-            LOGGER.info("Slash command /sluzebni-panel byl synchronizovan na serveru %s.", guild.id)
+            LOGGER.info(
+                "Slash commandy /sluzebni-panel a /doplnit-zadost byly synchronizovány na serveru %s.",
+                guild.id,
+            )
 
     def _is_configured_channel(self, channel: object) -> bool:
         return (
@@ -268,6 +310,12 @@ class TicketRenamerClient(discord.Client):
 
     async def on_ready(self) -> None:
         LOGGER.info("Bot je pripojen jako %s.", self.user)
+        self._write_health(ready=True, state="ready")
+        if self._health_task is None or self._health_task.done():
+            self._health_task = asyncio.create_task(
+                self._health_heartbeat(),
+                name="ticket-renamer-health",
+            )
         self._report(
             AppEvent(
                 EventLevel.SUCCESS,
@@ -310,6 +358,7 @@ class TicketRenamerClient(discord.Client):
     async def on_disconnect(self) -> None:
         if self._closing_requested:
             return
+        self._write_health(ready=False, state="disconnected")
         LOGGER.warning("Spojení s Discordem bylo přerušeno; klient se pokusí znovu připojit.")
         self._report(
             AppEvent(
@@ -321,6 +370,7 @@ class TicketRenamerClient(discord.Client):
         )
 
     async def on_resumed(self) -> None:
+        self._write_health(ready=True, state="ready")
         LOGGER.info("Spojení s Discordem bylo obnoveno.")
         self._report(
             AppEvent(
@@ -344,12 +394,33 @@ class TicketRenamerClient(discord.Client):
 
     async def close(self) -> None:
         self._closing_requested = True
+        self._write_health(ready=False, state="stopping")
+        health_task = self._health_task
+        self._health_task = None
+        if health_task is not None and health_task is not asyncio.current_task():
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
         if self._fiveroster is not None:
             try:
                 await self._fiveroster.close()
             except Exception:
                 LOGGER.exception("FiveRoster klient se nepodařilo korektně ukončit.")
         await super().close()
+
+    def _write_health(self, *, ready: bool, state: str) -> None:
+        try:
+            write_health_marker(ready=ready, state=state)
+        except OSError:
+            LOGGER.exception("Systemd health marker se nepodařilo zapsat.")
+
+    async def _health_heartbeat(self) -> None:
+        while not self._closing_requested:
+            if self.is_ready():
+                self._write_health(ready=True, state="ready")
+            await asyncio.sleep(60)
 
     async def on_message(self, message: discord.Message) -> None:
         await self._maybe_rename_from_message(message)
@@ -408,11 +479,71 @@ class TicketRenamerClient(discord.Client):
         message: discord.Message,
         *,
         allow_onboarding: bool = True,
+        allow_manual_fallback: bool = True,
     ) -> bool:
         if message.guild is None or not self._is_rename_target_channel(message.channel):
             return False
         if not self._is_ticket_tool_message(message) or not message.embeds:
             return False
+
+        recognizable_folder = is_recognizable_folder_embed(message.embeds)
+        manual_message: discord.Message | None = None
+        manual_record: ManualFallbackRecord | None = None
+        if recognizable_folder:
+            try:
+                manual_message, manual_record = await self._find_manual_fallback_message(
+                    message.channel
+                )
+            except ManualFallbackLookupError:
+                return False
+        if manual_record is not None and manual_record.is_authoritative:
+            if (
+                manual_message is not None
+                and manual_record.marker.state is ManualFallbackState.READY
+            ):
+                lock = self._channel_locks.setdefault(message.channel.id, asyncio.Lock())
+                async with lock:
+                    refreshed_message = await self._fetch_manual_source_message(
+                        message.channel,
+                        manual_message.id,
+                    )
+                    refreshed_record = (
+                        self._manual_record_from_message(refreshed_message)
+                        if refreshed_message is not None
+                        else None
+                    )
+                    if (
+                        refreshed_message is None
+                        or refreshed_record is None
+                        or not refreshed_record.is_authoritative
+                        or refreshed_record.marker.state is not ManualFallbackState.READY
+                    ):
+                        return False
+                    return await self._process_manual_record_locked(
+                        message.channel,
+                        refreshed_message,
+                        refreshed_record,
+                        actor_id=refreshed_record.marker.creator_id or 0,
+                        allow_onboarding=allow_onboarding,
+                    )
+            return await self._process_ticket_form(
+                message.channel,
+                manual_record.ticket_form,
+                manual_record.marker.member_id,
+                request_channel=None,
+                allow_onboarding=allow_onboarding,
+            )
+
+        async def create_fallback(reason: str) -> bool:
+            if not allow_manual_fallback or not recognizable_folder:
+                return False
+            fallback_message, created = await self._ensure_manual_fallback(
+                message.channel,
+                reason=reason,
+                selected_member_id=parse_selected_member_id(message.embeds),
+                prefill_form=ticket_form,
+            )
+            return created
 
         request_channel: discord.TextChannel | None = None
         selected_member_id = parse_selected_member_id(message.embeds)
@@ -423,15 +554,33 @@ class TicketRenamerClient(discord.Client):
                 self.settings.request_channel_prefixes,
             )
             if reference is None:
-                return False
+                return await create_fallback("Ve formuláři chybí platný kanál žádosti.")
 
             request_channel = await self._resolve_request_channel(message.guild, reference)
             if request_channel is None:
-                return False
+                return await create_fallback(
+                    "Vybraný kanál žádosti neexistuje nebo nemá povolený prefix."
+                )
 
             ticket_form = await self._read_ticket_form(request_channel)
             if ticket_form is None:
-                return False
+                return await create_fallback(
+                    "Ve vybraném kanálu žádosti nebyl nalezen podporovaný formulář."
+                )
+
+        if recognizable_folder:
+            if selected_member_id is None:
+                return await create_fallback(
+                    "Pole Uživatel chybí nebo neobsahuje platný Discord účet."
+                )
+            if not await self._guild_contains_member(message.guild, selected_member_id):
+                return await create_fallback(
+                    "Vybraný Discord uživatel není členem tohoto serveru."
+                )
+            if not ticket_form.birth_date or not ticket_form.phone_number:
+                return await create_fallback(
+                    "V žádosti chybí datum narození nebo telefonní číslo."
+                )
 
         desired_name = build_channel_name(
             ticket_form,
@@ -454,114 +603,200 @@ class TicketRenamerClient(discord.Client):
                         status="Připojeno – upozornění",
                     )
                 )
-            return False
-
-        lock = self._channel_locks.setdefault(message.channel.id, asyncio.Lock())
-        async with lock:
-            renamed = False
-            if message.channel.name != desired_name:
-                previous_name = message.channel.name
-                bot_member = message.guild.me
-                permissions = (
-                    message.channel.permissions_for(bot_member)
-                    if bot_member is not None
-                    else None
-                )
-
-                if permissions is not None and not permissions.manage_channels:
-                    LOGGER.error(
-                        "Bot nema opravneni Spravovat kanaly v osobni slozce %s.",
-                        message.channel.id,
-                    )
-                    self._report(
-                        AppEvent(
-                            EventLevel.ERROR,
-                            "Chybí oprávnění",
-                            f"Bot nemůže přejmenovat kanál {message.channel.name}: chybí Spravovat kanály.",
-                            status="Připojeno – chyba oprávnění",
-                        )
-                    )
-                else:
-                    try:
-                        await message.channel.edit(
-                            name=desired_name,
-                            reason="Automaticke prejmenovani osobni slozky podle formulare zadosti",
-                        )
-                        renamed = True
-                    except discord.Forbidden:
-                        LOGGER.error(
-                            "Discord zakazal prejmenovani kanalu %s. Zkontrolujte opravneni bota.",
-                            message.channel.id,
-                        )
-                        self._report(
-                            AppEvent(
-                                EventLevel.ERROR,
-                                "Discord zakázal změnu",
-                                f"Kanál {message.channel.name} nebyl přejmenován. Zkontrolujte oprávnění bota.",
-                                status="Připojeno – chyba oprávnění",
-                            )
-                        )
-                    except discord.HTTPException:
-                        LOGGER.exception("Discord neprejmenoval kanal %s.", message.channel.id)
-                        self._report(
-                            AppEvent(
-                                EventLevel.ERROR,
-                                "Přejmenování selhalo",
-                                f"Discord nepřejmenoval kanál {message.channel.name}. Podrobnosti jsou v logu.",
-                                status="Připojeno – chyba Discordu",
-                            )
-                        )
-
-                if renamed:
-                    LOGGER.info(
-                        "Osobni slozka %s byla prejmenovana podle pozice %s.",
-                        message.channel.id,
-                        ticket_form.position,
-                    )
-                    self._report(
-                        AppEvent(
-                            EventLevel.SUCCESS,
-                            "Osobní složka přejmenována",
-                            f"{previous_name} → {desired_name}",
-                            status="Připojeno",
-                        )
-                    )
-
-            info_changed = await self._upsert_employee_info(
-                message.channel,
-                ticket_form,
-                request_channel,
+            return await create_fallback(
+                "Pozice v žádosti není podporovaná nebo chybí platné jméno."
             )
 
-            onboarding_changed = False
-            if allow_onboarding and selected_member_id is not None:
-                onboarding_changed = await self._upsert_onboarding(
-                    message.channel,
+        processing_result = await self._process_ticket_form_result(
+            message.channel,
+            ticket_form,
+            selected_member_id,
+            request_channel=request_channel,
+            allow_onboarding=allow_onboarding,
+        )
+        changed = processing_result.changed
+        if manual_message is not None and manual_record is not None:
+            if manual_record.marker.state is ManualFallbackState.WAITING:
+                if await self._ticket_core_is_complete(
+                    processing_result.channel,
                     ticket_form,
-                    selected_member_id,
-                )
-            elif (
-                allow_onboarding
-                and self.settings.fiveroster_enabled
-                and request_channel is not None
-            ):
-                LOGGER.warning(
-                    "Osobni slozka %s nema platne pole Uzivatel; FiveRoster workflow nevznikl.",
-                    message.channel.id,
+                    request_channel=request_channel,
+                ):
+                    await self._edit_manual_fallback_message(
+                        manual_message,
+                        state=ManualFallbackState.DONE,
+                        reason="Zdrojová žádost už je dostupná a byla úspěšně načtena.",
+                        source=ManualFallbackSource.REQUEST,
+                        member_id=None,
+                        creator_id=None,
+                        ticket_form=None,
+                    )
+        return changed
+
+    async def _process_ticket_form(
+        self,
+        channel: discord.TextChannel,
+        ticket_form: TicketForm,
+        selected_member_id: int | None,
+        *,
+        request_channel: discord.TextChannel | None,
+        allow_onboarding: bool,
+    ) -> bool:
+        result = await self._process_ticket_form_result(
+            channel,
+            ticket_form,
+            selected_member_id,
+            request_channel=request_channel,
+            allow_onboarding=allow_onboarding,
+        )
+        return result.changed
+
+    async def _process_ticket_form_result(
+        self,
+        channel: discord.TextChannel,
+        ticket_form: TicketForm,
+        selected_member_id: int | None,
+        *,
+        request_channel: discord.TextChannel | None,
+        allow_onboarding: bool,
+    ) -> TicketFormProcessingResult:
+        desired_name = build_channel_name(
+            ticket_form,
+            separator=self.settings.channel_separator,
+        )
+        if desired_name is None:
+            return TicketFormProcessingResult(False, channel)
+
+        lock = self._channel_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            return await self._process_ticket_form_locked(
+                channel,
+                ticket_form,
+                selected_member_id,
+                request_channel=request_channel,
+                allow_onboarding=allow_onboarding,
+            )
+
+    async def _process_ticket_form_locked(
+        self,
+        channel: discord.TextChannel,
+        ticket_form: TicketForm,
+        selected_member_id: int | None,
+        *,
+        request_channel: discord.TextChannel | None,
+        allow_onboarding: bool,
+    ) -> TicketFormProcessingResult:
+        desired_name = build_channel_name(
+            ticket_form,
+            separator=self.settings.channel_separator,
+        )
+        if desired_name is None:
+            return TicketFormProcessingResult(False, channel)
+
+        renamed = False
+        if channel.name != desired_name:
+            previous_name = channel.name
+            bot_member = channel.guild.me
+            permissions = (
+                channel.permissions_for(bot_member)
+                if bot_member is not None
+                else None
+            )
+
+            if permissions is not None and not permissions.manage_channels:
+                LOGGER.error(
+                    "Bot nema opravneni Spravovat kanaly v osobni slozce %s.",
+                    channel.id,
                 )
                 self._report(
                     AppEvent(
                         EventLevel.ERROR,
-                        "Ve složce chybí uživatel",
-                        (
-                            f"Kanál {message.channel.name} byl přejmenován, ale pole Uživatel "
-                            "neobsahuje platný Discord účet. FiveRoster nástup nebyl vytvořen."
-                        ),
-                        status="Připojeno – chyba formuláře",
+                        "Chybí oprávnění",
+                        f"Bot nemůže přejmenovat kanál {channel.name}: chybí Spravovat kanály.",
+                        status="Připojeno – chyba oprávnění",
+                    )
+                )
+            else:
+                try:
+                    edited_channel = await channel.edit(
+                        name=desired_name,
+                        reason="Automaticke prejmenovani osobni slozky podle formulare zadosti",
+                    )
+                    if edited_channel is not None:
+                        channel = edited_channel
+                    renamed = True
+                except discord.Forbidden:
+                    LOGGER.error(
+                        "Discord zakazal prejmenovani kanalu %s. Zkontrolujte opravneni bota.",
+                        channel.id,
+                    )
+                    self._report(
+                        AppEvent(
+                            EventLevel.ERROR,
+                            "Discord zakázal změnu",
+                            f"Kanál {channel.name} nebyl přejmenován. Zkontrolujte oprávnění bota.",
+                            status="Připojeno – chyba oprávnění",
+                        )
+                    )
+                except discord.HTTPException:
+                    LOGGER.exception("Discord neprejmenoval kanal %s.", channel.id)
+                    self._report(
+                        AppEvent(
+                            EventLevel.ERROR,
+                            "Přejmenování selhalo",
+                            f"Discord nepřejmenoval kanál {channel.name}. Podrobnosti jsou v logu.",
+                            status="Připojeno – chyba Discordu",
+                        )
+                    )
+
+            if renamed:
+                LOGGER.info(
+                    "Osobni slozka %s byla prejmenovana podle pozice %s.",
+                    channel.id,
+                    ticket_form.position,
+                )
+                self._report(
+                    AppEvent(
+                        EventLevel.SUCCESS,
+                        "Osobní složka přejmenována",
+                        f"{previous_name} → {desired_name}",
+                        status="Připojeno",
                     )
                 )
 
-        return renamed or info_changed or onboarding_changed
+        info_changed = await self._upsert_employee_info(
+            channel,
+            ticket_form,
+            request_channel,
+        )
+
+        onboarding_changed = False
+        if allow_onboarding and selected_member_id is not None:
+            onboarding_changed = await self._upsert_onboarding(
+                channel,
+                ticket_form,
+                selected_member_id,
+            )
+        elif allow_onboarding and self.settings.fiveroster_enabled:
+            LOGGER.warning(
+                "Osobni slozka %s nema platne pole Uzivatel; FiveRoster workflow nevznikl.",
+                channel.id,
+            )
+            self._report(
+                AppEvent(
+                    EventLevel.ERROR,
+                    "Ve složce chybí uživatel",
+                    (
+                        f"Kanál {channel.name} byl přejmenován, ale pole Uživatel "
+                        "neobsahuje platný Discord účet. FiveRoster nástup nebyl vytvořen."
+                    ),
+                    status="Připojeno – chyba formuláře",
+                )
+            )
+        return TicketFormProcessingResult(
+            renamed or info_changed or onboarding_changed,
+            channel,
+        )
 
     async def _upsert_employee_info(
         self,
@@ -722,6 +957,569 @@ class TicketRenamerClient(discord.Client):
             )
         )
         return True
+
+    async def _guild_contains_member(self, guild: discord.Guild, member_id: int) -> bool:
+        get_member = getattr(guild, "get_member", None)
+        if callable(get_member) and get_member(member_id) is not None:
+            return True
+
+        fetch_member = getattr(guild, "fetch_member", None)
+        if not callable(fetch_member):
+            # Test doubles and older adapters do not always expose the member cache API.
+            return not callable(get_member)
+        try:
+            await fetch_member(member_id)
+            return True
+        except discord.NotFound:
+            return False
+        except discord.Forbidden:
+            LOGGER.warning("Bot nemůže ověřit členství zaměstnance na serveru.")
+            return False
+        except discord.HTTPException:
+            LOGGER.exception("Discord neověřil členství zaměstnance na serveru.")
+            return False
+
+    async def _find_manual_fallback_message(
+        self,
+        channel: discord.TextChannel,
+    ) -> tuple[discord.Message | None, ManualFallbackRecord | None]:
+        bot_user_id = getattr(self.user, "id", None)
+        try:
+            async for candidate in channel.history(
+                limit=MANUAL_FALLBACK_HISTORY_LIMIT,
+                oldest_first=False,
+            ):
+                if bot_user_id is None or candidate.author.id != bot_user_id:
+                    continue
+                for candidate_embed in candidate.embeds:
+                    record = parse_manual_fallback_embed(candidate_embed)
+                    if record is not None:
+                        return candidate, record
+        except discord.Forbidden:
+            LOGGER.error("Bot nema pristup k historii rucni zadosti v kanalu %s.", channel.id)
+            self._report(
+                AppEvent(
+                    EventLevel.ERROR,
+                    "Ruční žádost nelze zkontrolovat",
+                    f"Bot nemůže číst historii kanálu {channel.name}.",
+                    status="Připojeno – chyba oprávnění",
+                )
+            )
+            raise ManualFallbackLookupError from None
+        except discord.HTTPException:
+            LOGGER.exception("Kontrola rucni zadosti v kanalu %s selhala.", channel.id)
+            raise ManualFallbackLookupError from None
+        return None, None
+
+    async def _edit_manual_fallback_message(
+        self,
+        message: discord.Message,
+        *,
+        state: ManualFallbackState,
+        reason: str,
+        source: ManualFallbackSource,
+        member_id: int | None,
+        creator_id: int | None,
+        ticket_form: TicketForm | None,
+    ) -> bool:
+        try:
+            await message.edit(
+                embed=build_manual_fallback_embed(
+                    state=state,
+                    reason=reason,
+                    source=source,
+                    member_id=member_id,
+                    creator_id=creator_id,
+                    ticket_form=ticket_form,
+                ),
+                view=ManualRecoveryView(
+                    self._handle_manual_recovery_interaction,
+                    state=state,
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
+        except discord.Forbidden:
+            LOGGER.error("Discord zakazal upravu rucni zadosti %s.", message.id)
+            self._report(
+                AppEvent(
+                    EventLevel.ERROR,
+                    "Ruční žádost nelze upravit",
+                    "Bot nemá oprávnění aktualizovat obnovovací formulář.",
+                    status="Připojeno – chyba oprávnění",
+                )
+            )
+        except discord.HTTPException:
+            LOGGER.exception("Discord neupravil rucni zadost %s.", message.id)
+        return False
+
+    async def _ensure_manual_fallback(
+        self,
+        channel: discord.TextChannel,
+        *,
+        reason: str,
+        selected_member_id: int | None = None,
+        creator_id: int | None = None,
+        prefill_form: TicketForm | None = None,
+    ) -> tuple[discord.Message | None, bool]:
+        lock = self._channel_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            try:
+                existing_message, existing_record = await self._find_manual_fallback_message(
+                    channel
+                )
+            except ManualFallbackLookupError:
+                return None, False
+            if existing_message is not None and existing_record is not None:
+                if existing_record.marker.state is ManualFallbackState.WAITING:
+                    target_member_id = existing_record.marker.member_id or selected_member_id
+                    target_creator_id = existing_record.marker.creator_id or creator_id
+                    target_form = existing_record.ticket_form or prefill_form
+                    if not (
+                        existing_record.reason == reason
+                        and existing_record.marker.member_id == target_member_id
+                        and existing_record.marker.creator_id == target_creator_id
+                        and existing_record.ticket_form == target_form
+                    ):
+                        await self._edit_manual_fallback_message(
+                            existing_message,
+                            state=ManualFallbackState.WAITING,
+                            reason=reason,
+                            source=existing_record.marker.source,
+                            member_id=target_member_id,
+                            creator_id=target_creator_id,
+                            ticket_form=target_form,
+                        )
+                return existing_message, False
+
+            bot_member = channel.guild.me
+            permissions = (
+                channel.permissions_for(bot_member) if bot_member is not None else None
+            )
+            if permissions is not None and (
+                not permissions.send_messages or not permissions.embed_links
+            ):
+                LOGGER.error("Bot nema opravneni vytvorit rucni zadost v kanalu %s.", channel.id)
+                self._report(
+                    AppEvent(
+                        EventLevel.ERROR,
+                        "Formulář nelze vytvořit",
+                        f"Bot nemůže poslat obnovovací formulář do {channel.name}.",
+                        status="Připojeno – chyba oprávnění",
+                    )
+                )
+                return None, False
+
+            try:
+                sent = await channel.send(
+                    embed=build_manual_fallback_embed(
+                        state=ManualFallbackState.WAITING,
+                        reason=reason,
+                        member_id=selected_member_id,
+                        creator_id=creator_id,
+                        ticket_form=prefill_form,
+                    ),
+                    view=ManualRecoveryView(
+                        self._handle_manual_recovery_interaction,
+                        state=ManualFallbackState.WAITING,
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.Forbidden:
+                LOGGER.error("Discord zakazal rucni formular v kanalu %s.", channel.id)
+                return None, False
+            except discord.HTTPException:
+                LOGGER.exception("Discord neposlal rucni formular do kanalu %s.", channel.id)
+                return None, False
+
+            LOGGER.info("V kanalu %s byl vytvoren formular pro rucni doplneni zadosti.", channel.id)
+            self._report(
+                AppEvent(
+                    EventLevel.WARNING,
+                    "Žádost vyžaduje ruční doplnění",
+                    f"V kanálu {channel.name} byl vytvořen formulář pro Vedení.",
+                    status="Připojeno – čeká na údaje",
+                )
+            )
+            return sent, True
+
+    async def _manual_interaction_guard(self, interaction: discord.Interaction) -> bool:
+        guild = interaction.guild
+        channel = interaction.channel
+        if (
+            guild is None
+            or not isinstance(channel, discord.TextChannel)
+            or not self._is_rename_target_channel(channel)
+        ):
+            await self._interaction_reply(
+                interaction,
+                "Toto ovládání lze použít pouze v osobní složce na serveru.",
+            )
+            return False
+        if not self._has_onboarding_operator_role(interaction.user):
+            LOGGER.warning(
+                "Ruční žádost se někdo pokusil použít bez role vedení v kanálu %s.",
+                channel.id,
+            )
+            await self._interaction_reply(
+                interaction,
+                "Nemáte oprávnění. Formulář může použít pouze nakonfigurovaná role Vedení.",
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _manual_record_from_message(
+        message: discord.Message,
+    ) -> ManualFallbackRecord | None:
+        for embed in message.embeds:
+            record = parse_manual_fallback_embed(embed)
+            if record is not None:
+                return record
+        return None
+
+    async def _fetch_manual_source_message(
+        self,
+        channel: discord.TextChannel,
+        message_id: int,
+    ) -> discord.Message | None:
+        try:
+            return await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return None
+        except (discord.Forbidden, discord.HTTPException):
+            LOGGER.exception("Rucni zadost %s se nepodarilo znovu nacist.", message_id)
+            return None
+
+    async def _resolve_manual_initial_member(
+        self,
+        guild: discord.Guild,
+        member_id: int | None,
+    ) -> object | None:
+        if member_id is None:
+            return None
+        get_member = getattr(guild, "get_member", None)
+        member = get_member(member_id) if callable(get_member) else None
+        if member is not None:
+            return member
+        fetch_member = getattr(guild, "fetch_member", None)
+        if callable(fetch_member):
+            try:
+                return await fetch_member(member_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        return None
+
+    async def _handle_manual_recovery_interaction(
+        self,
+        interaction: discord.Interaction,
+        action: ManualRecoveryAction,
+    ) -> None:
+        if not await self._manual_interaction_guard(interaction):
+            return
+        channel = interaction.channel
+        source_message = interaction.message
+        if not isinstance(channel, discord.TextChannel) or source_message is None:
+            await self._interaction_reply(interaction, "Obnovovací zpráva už není dostupná.")
+            return
+
+        current_message = await self._fetch_manual_source_message(channel, source_message.id)
+        if current_message is None:
+            await self._interaction_reply(interaction, "Obnovovací zpráva už neexistuje.")
+            return
+        record = self._manual_record_from_message(current_message)
+        if record is None:
+            await self._interaction_reply(interaction, "Obnovovací zpráva nemá platný stav.")
+            return
+
+        if action is ManualRecoveryAction.RETRY:
+            if not record.is_authoritative or record.marker.state is not ManualFallbackState.READY:
+                await self._interaction_reply(
+                    interaction,
+                    "Tato žádost nyní nemá nedokončené zpracování.",
+                )
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            lock = self._channel_locks.setdefault(channel.id, asyncio.Lock())
+            async with lock:
+                refreshed = await self._fetch_manual_source_message(channel, current_message.id)
+                refreshed_record = (
+                    self._manual_record_from_message(refreshed) if refreshed is not None else None
+                )
+                if refreshed is None or refreshed_record is None or not refreshed_record.is_authoritative:
+                    await interaction.followup.send(
+                        "Stav žádosti se mezitím změnil; otevřete formulář znovu.",
+                        ephemeral=True,
+                    )
+                    return
+                if refreshed_record.marker.state is not ManualFallbackState.READY:
+                    await interaction.followup.send(
+                        "Tato žádost už byla zpracována jiným požadavkem.",
+                        ephemeral=True,
+                    )
+                    return
+                complete = await self._process_manual_record_locked(
+                    channel,
+                    refreshed,
+                    refreshed_record,
+                    actor_id=interaction.user.id,
+                )
+            await interaction.followup.send(
+                "Ruční žádost byla zpracována."
+                if complete
+                else "Zpracování není kompletní. Opravte oprávnění a použijte Opakovat.",
+                ephemeral=True,
+            )
+            return
+
+        initial_member = await self._resolve_manual_initial_member(
+            interaction.guild,
+            record.marker.member_id,
+        )
+        await interaction.response.send_message(
+            "Vyberte zaměstnance a pozici, potom pokračujte k základním údajům.",
+            view=ManualSelectionView(
+                self._manual_interaction_guard,
+                self._handle_manual_submission,
+                source_message_id=current_message.id,
+                initial_member=initial_member,
+                initial_position=(
+                    record.ticket_form.position if record.ticket_form is not None else None
+                ),
+                ticket_form=record.ticket_form,
+            ),
+            ephemeral=True,
+        )
+
+    async def _handle_manual_submission(
+        self,
+        interaction: discord.Interaction,
+        submission: ManualSubmission,
+    ) -> None:
+        if not await self._manual_interaction_guard(interaction):
+            return
+        guild = interaction.guild
+        channel = interaction.channel
+        if guild is None or not isinstance(channel, discord.TextChannel):
+            return
+        if submission.member_id <= 0 or not await self._guild_contains_member(
+            guild,
+            submission.member_id,
+        ):
+            await self._interaction_reply(
+                interaction,
+                "Vybraný uživatel už není členem tohoto serveru.",
+            )
+            return
+        member_guild = getattr(submission.member, "guild", guild)
+        if getattr(member_guild, "id", guild.id) != guild.id:
+            await self._interaction_reply(
+                interaction,
+                "Vybraný uživatel nepatří na tento server.",
+            )
+            return
+        try:
+            ticket_form = validate_manual_ticket_form(
+                submission.full_name,
+                submission.birth_date,
+                submission.phone_number,
+                submission.position,
+            )
+        except ManualValidationError as exc:
+            await self._interaction_reply(interaction, str(exc))
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lock = self._channel_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            current_message = await self._fetch_manual_source_message(
+                channel,
+                submission.source_message_id,
+            )
+            current_record = (
+                self._manual_record_from_message(current_message)
+                if current_message is not None
+                else None
+            )
+            if current_message is None or current_record is None:
+                await interaction.followup.send(
+                    "Obnovovací zpráva už neexistuje nebo nemá platný stav.",
+                    ephemeral=True,
+                )
+                return
+
+            _, onboarding_marker = await self._find_onboarding_message(channel)
+            if (
+                onboarding_marker is not None
+                and onboarding_marker.state
+                in {OnboardingState.COMPLETED, OnboardingState.PARTIAL}
+                and onboarding_marker.member_id != submission.member_id
+            ):
+                await interaction.followup.send(
+                    "Kanál už obsahuje dokončený nástup jiného uživatele. Údaje nebyly změněny.",
+                    ephemeral=True,
+                )
+                return
+
+            same_completed_record = (
+                current_record.marker.state is ManualFallbackState.DONE
+                and current_record.marker.source is ManualFallbackSource.MANUAL
+                and current_record.marker.member_id == submission.member_id
+                and current_record.ticket_form == ticket_form
+            )
+            if same_completed_record:
+                await interaction.followup.send(
+                    "Stejné údaje už jsou zpracované.",
+                    ephemeral=True,
+                )
+                return
+
+            saved = await self._edit_manual_fallback_message(
+                current_message,
+                state=ManualFallbackState.READY,
+                reason="Údaje byly ručně doplněny rolí Vedení.",
+                source=ManualFallbackSource.MANUAL,
+                member_id=submission.member_id,
+                creator_id=interaction.user.id,
+                ticket_form=ticket_form,
+            )
+            if not saved:
+                await interaction.followup.send(
+                    "Údaje nebylo možné bezpečně uložit, proto se nic dalšího nezpracovalo.",
+                    ephemeral=True,
+                )
+                return
+            ready_record = ManualFallbackRecord(
+                marker=ManualFallbackMarker(
+                    state=ManualFallbackState.READY,
+                    source=ManualFallbackSource.MANUAL,
+                    member_id=submission.member_id,
+                    creator_id=interaction.user.id,
+                ),
+                ticket_form=ticket_form,
+                reason="Údaje byly ručně doplněny rolí Vedení.",
+            )
+            complete = await self._process_manual_record_locked(
+                channel,
+                current_message,
+                ready_record,
+                actor_id=interaction.user.id,
+            )
+
+        await interaction.followup.send(
+            "Údaje byly uloženy a osobní složka byla zpracována."
+            if complete
+            else "Údaje jsou uložené, ale zpracování není kompletní. Použijte Opakovat.",
+            ephemeral=True,
+        )
+
+    async def _process_manual_record_locked(
+        self,
+        channel: discord.TextChannel,
+        message: discord.Message,
+        record: ManualFallbackRecord,
+        *,
+        actor_id: int,
+        allow_onboarding: bool = True,
+    ) -> bool:
+        if not record.is_authoritative:
+            return False
+        processing_result = await self._process_ticket_form_locked(
+            channel,
+            record.ticket_form,
+            record.marker.member_id,
+            request_channel=None,
+            allow_onboarding=allow_onboarding,
+        )
+        complete = await self._manual_core_is_complete(
+            processing_result.channel,
+            record.ticket_form,
+        )
+        final_reason = (
+            "Ruční údaje byly zpracovány."
+            if complete
+            else "Ruční údaje jsou uložené, ale přejmenování nebo informační embed selhaly."
+        )
+        await self._edit_manual_fallback_message(
+            message,
+            state=(ManualFallbackState.DONE if complete else ManualFallbackState.READY),
+            reason=final_reason,
+            source=ManualFallbackSource.MANUAL,
+            member_id=record.marker.member_id,
+            creator_id=record.marker.creator_id or actor_id,
+            ticket_form=record.ticket_form,
+        )
+        return complete
+
+    async def _manual_core_is_complete(
+        self,
+        channel: discord.TextChannel,
+        ticket_form: TicketForm,
+    ) -> bool:
+        return await self._ticket_core_is_complete(
+            channel,
+            ticket_form,
+            request_channel=None,
+        )
+
+    async def _ticket_core_is_complete(
+        self,
+        channel: discord.TextChannel,
+        ticket_form: TicketForm,
+        *,
+        request_channel: discord.TextChannel | None,
+    ) -> bool:
+        if channel.name != build_channel_name(
+            ticket_form,
+            separator=self.settings.channel_separator,
+        ):
+            return False
+        expected = build_employee_info_embed(
+            ticket_form,
+            request_channel.name if request_channel is not None else None,
+        ).to_dict()
+        bot_user_id = getattr(self.user, "id", None)
+        try:
+            async for candidate in channel.history(
+                limit=EMPLOYEE_INFO_HISTORY_LIMIT,
+                oldest_first=False,
+            ):
+                if bot_user_id is None or candidate.author.id != bot_user_id:
+                    continue
+                for embed in candidate.embeds:
+                    if _is_employee_info_embed(embed) and embed.to_dict() == expected:
+                        return True
+        except (discord.Forbidden, discord.HTTPException):
+            LOGGER.exception("Kontrola rucne doplnenych udaju v kanalu %s selhala.", channel.id)
+        return False
+
+    async def _handle_manual_request_command(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if not await self._manual_interaction_guard(interaction):
+            return
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message, created = await self._ensure_manual_fallback(
+            channel,
+            reason="Formulář byl vyžádán ručně příkazem /doplnit-zadost.",
+            creator_id=interaction.user.id,
+        )
+        if message is None:
+            await interaction.followup.send(
+                "Formulář se nepodařilo vytvořit. Zkontrolujte oprávnění bota.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            "Formulář byl vytvořen v tomto kanálu."
+            if created
+            else "Formulář už v tomto kanálu existuje a byl obnoven.",
+            ephemeral=True,
+        )
 
     async def _find_onboarding_message(
         self,
@@ -1205,8 +2003,7 @@ class TicketRenamerClient(discord.Client):
             )
         if created:
             LOGGER.info(
-                "Sluzebni panel clena %s byl vytvoren v kanalu %s.",
-                member_id,
+                "Služební panel zaměstnance byl vytvořen v kanálu %s.",
                 channel.id,
             )
             self._report(
@@ -1577,8 +2374,7 @@ class TicketRenamerClient(discord.Client):
             detail += f" Volací znak: {enrollment.callsign}."
 
         LOGGER.info(
-            "Onboarding clena %s na hodnost %s byl dokoncen v kanalu %s.",
-            member_id,
+            "Onboarding zaměstnance na hodnost %s byl dokončen v kanálu %s.",
             enrollment.rank.name,
             channel.id,
         )
@@ -1652,8 +2448,7 @@ class TicketRenamerClient(discord.Client):
         }
         if not operator_role_ids.intersection(self.settings.onboarding_operator_role_ids):
             LOGGER.warning(
-                "Uzivatel %s se pokusil pouzit onboarding bez role vedeni v kanalu %s.",
-                interaction.user.id,
+                "Onboarding se někdo pokusil použít bez role vedení v kanálu %s.",
                 channel.id,
             )
             await self._interaction_reply(
@@ -1813,8 +2608,7 @@ class TicketRenamerClient(discord.Client):
             return
         if not self._has_onboarding_operator_role(interaction.user):
             LOGGER.warning(
-                "Uzivatel %s pouzil /sluzebni-panel bez role vedeni v kanalu %s.",
-                interaction.user.id,
+                "/sluzebni-panel se někdo pokusil použít bez role vedení v kanálu %s.",
                 channel.id,
             )
             await self._interaction_reply(
@@ -1865,10 +2659,8 @@ class TicketRenamerClient(discord.Client):
         if result.message is not None and not result.conflict:
             operation = "zalozil" if result.created else "obnovil"
             LOGGER.info(
-                "Vedouci %s rucne %s sluzebni panel clena %s v kanalu %s.",
-                interaction.user.id,
+                "Člen vedení ručně %s služební panel zaměstnance v kanálu %s.",
                 operation,
-                member.id,
                 channel.id,
             )
 
@@ -1934,9 +2726,7 @@ class TicketRenamerClient(discord.Client):
             return
         if interaction.user.id != source_marker.member_id:
             LOGGER.warning(
-                "Uzivatel %s se pokusil ovladat panel clena %s v kanalu %s.",
-                interaction.user.id,
-                source_marker.member_id,
+                "Cizí uživatel se pokusil ovládat služební panel v kanálu %s.",
                 channel.id,
             )
             await self._interaction_reply(
@@ -2095,7 +2885,7 @@ class TicketRenamerClient(discord.Client):
             creator_id=marker.creator_id,
             snapshot=updated_snapshot,
         )
-        LOGGER.info("Clen %s vstoupil do sluzby v kanalu %s.", marker.member_id, channel.id)
+        LOGGER.info("Zaměstnanec vstoupil do služby v kanálu %s.", channel.id)
         self._report(
             AppEvent(
                 EventLevel.SUCCESS,
@@ -2172,7 +2962,7 @@ class TicketRenamerClient(discord.Client):
             force_refresh=True,
         )
         duration = getattr(ended_shift, "formatted_duration", "")
-        LOGGER.info("Clen %s ukoncil sluzbu v kanalu %s.", marker.member_id, channel.id)
+        LOGGER.info("Zaměstnanec ukončil službu v kanálu %s.", channel.id)
         self._report(
             AppEvent(
                 EventLevel.SUCCESS,
@@ -2319,7 +3109,7 @@ class TicketRenamerClient(discord.Client):
                 snapshot=updated_snapshot,
             )
 
-        LOGGER.info("Clen %s vytvoril LOA %s v kanalu %s.", member_id, created.id, channel.id)
+        LOGGER.info("Zaměstnanec vytvořil LOA v kanálu %s.", channel.id)
         self._report(
             AppEvent(
                 EventLevel.SUCCESS,
@@ -2435,7 +3225,7 @@ class TicketRenamerClient(discord.Client):
             )
 
         if cancelled_now:
-            LOGGER.info("Clen %s zrusil LOA %s v kanalu %s.", member_id, loa_id, channel.id)
+            LOGGER.info("Zaměstnanec zrušil LOA v kanálu %s.", channel.id)
             self._report(
                 AppEvent(
                     EventLevel.SUCCESS,
@@ -2632,6 +3422,7 @@ class TicketRenamerClient(discord.Client):
                         if await self._maybe_rename_from_message(
                             message,
                             allow_onboarding=False,
+                            allow_manual_fallback=False,
                         ):
                             channel_changed = True
                         break
@@ -2681,8 +3472,14 @@ class TicketRenamerClient(discord.Client):
 
 def run() -> None:
     settings = Settings.from_environment()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    configure_logging(
+        settings.log_level,
+        known_secrets=secret_values_from_environment(),
+    )
+    LOGGER.info(
+        "Start verze %s: %d kategorií, FiveRoster %s.",
+        __version__,
+        len(settings.ticket_category_ids),
+        "zapnutý" if settings.fiveroster_enabled else "vypnutý",
     )
     TicketRenamerClient(settings).run(settings.discord_bot_token, log_handler=None)
