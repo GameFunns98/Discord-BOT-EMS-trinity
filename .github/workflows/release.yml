@@ -85,8 +85,9 @@ jobs:
           '@ | Set-Content -Encoding utf8 dist/.env
           Push-Location dist
           try {
-            & ./TicketRenamerTray.exe --self-test
-            if ($LASTEXITCODE -ne 0) { throw "EXE self-test skoncil s kodem $LASTEXITCODE." }
+            $executable = (Resolve-Path ./TicketRenamerTray.exe).Path
+            $process = Start-Process -FilePath $executable -ArgumentList '--self-test' -WorkingDirectory $PWD.Path -Wait -PassThru -WindowStyle Hidden
+            if ($process.ExitCode -ne 0) { throw "EXE self-test skoncil s kodem $($process.ExitCode)." }
           }
           finally {
             Pop-Location
