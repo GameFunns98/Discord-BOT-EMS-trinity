@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Discord Ticket Renamer releases every ten minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=discord-ticket-renamer-update.service
+
+[Install]
+WantedBy=timers.target

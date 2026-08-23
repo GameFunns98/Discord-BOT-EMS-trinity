@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[windows]" pytest
+      - name: Run unit tests
+        run: xvfb-run -a python -m pytest -q
+
+  linux-release:
+    name: Linux release payload
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Create pinned Linux dependency lock
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip freeze --all --exclude discord-ticket-renamer > requirements-linux.lock
+      - name: Validate versions and build verified archive
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: python scripts/build_release.py --tag "${GITHUB_REF_NAME}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  windows-release:
+    name: Windows EXE and ZIP
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[windows]" pyinstaller
+      - name: Build tray application
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name TicketRenamerTray tray_launcher.py
+      - name: Run offline EXE self-test
+        shell: pwsh
+        run: |
+          @'
+          DISCORD_BOT_TOKEN=release-self-test-token
+          TICKET_TOOL_BOT_IDS=1325579039888511056
+          TICKET_CATEGORY_IDS=1511618288373858435
+          LOG_LEVEL=INFO
+          '@ | Set-Content -Encoding utf8 dist/.env
+          Push-Location dist
+          try {
+            & ./TicketRenamerTray.exe --self-test
+            if ($LASTEXITCODE -ne 0) { throw "EXE self-test skoncil s kodem $LASTEXITCODE." }
+          }
+          finally {
+            Pop-Location
+            Remove-Item -LiteralPath dist/.env -Force -ErrorAction SilentlyContinue
+          }
+      - name: Create Windows package
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $package = Join-Path $PWD 'windows-package'
+          $assets = Join-Path $PWD 'release-assets'
+          New-Item -ItemType Directory -Force -Path $package, $assets | Out-Null
+          Copy-Item dist/TicketRenamerTray.exe $package/TicketRenamerTray.exe
+          Copy-Item setup.ps1, remove-autostart.ps1, start-bot.ps1, README.md $package
+          if (Test-Path .env.example) { Copy-Item .env.example $package }
+          Copy-Item dist/TicketRenamerTray.exe $assets/TicketRenamerTray.exe
+          Compress-Archive -Path "$package/*" -DestinationPath "$assets/discord-ticket-renamer-$version-windows.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish stable GitHub Release
+    needs: [linux-release, windows-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release-assets"
+          path: release-assets
+          merge-multiple: true
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" release-assets/*
+          --verify-tag --title "Discord Ticket Renamer ${GITHUB_REF_NAME}"
+          --generate-notes

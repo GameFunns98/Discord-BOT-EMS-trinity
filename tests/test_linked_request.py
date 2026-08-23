@@ -5,12 +5,17 @@ from unittest.mock import patch
 
 from ticket_renamer.bot import TicketRenamerClient
 from ticket_renamer.config import Settings
+from ticket_renamer.manual_fallback import (
+    ManualFallbackState,
+    parse_manual_fallback_embed,
+)
 
 
 TICKET_TOOL_BOT_ID = 1325579039888511056
 RENAMER_BOT_ID = 1444444444444444444
 FOLDER_CATEGORY_ID = 1511618288373858435
 REQUEST_CHANNEL_ID = 1512345678901234567
+MEMBER_ID = 123456789012345678
 
 
 class FakeMessage:
@@ -26,9 +31,18 @@ class FakeMessage:
         self.guild = channel.guild
         self.embeds = embeds
         self.edit_count = 0
+        self.id = id(self)
+        self.view = None
 
-    async def edit(self, *, embed: object, allowed_mentions: object) -> None:
+    async def edit(
+        self,
+        *,
+        embed: object,
+        allowed_mentions: object,
+        view: object | None = None,
+    ) -> None:
         self.embeds = [embed]
+        self.view = view
         self.edit_count += 1
 
 
@@ -71,12 +85,19 @@ class FakeTextChannel:
         self.edits.append((name, reason))
         self.name = name
 
-    async def send(self, *, embed: object, allowed_mentions: object) -> FakeMessage:
+    async def send(
+        self,
+        *,
+        embed: object,
+        allowed_mentions: object,
+        view: object | None = None,
+    ) -> FakeMessage:
         sent_message = FakeMessage(
             channel=self,
             embeds=[embed],
             author_id=RENAMER_BOT_ID,
         )
+        sent_message.view = view
         self._messages.append(sent_message)
         self.sent_messages.append(sent_message)
         return sent_message
@@ -174,7 +195,14 @@ class LinkedRequestFlowTests(unittest.IsolatedAsyncioTestCase):
         self.guild.text_channels.extend([request_channel, personal_folder])
         folder_message = message(
             personal_folder,
-            [embed([("Kanál žádosti", f"<#{REQUEST_CHANNEL_ID}>")])],
+            [
+                embed(
+                    [
+                        ("Uživatel", f"<@{MEMBER_ID}>"),
+                        ("Kanál žádosti", f"<#{REQUEST_CHANNEL_ID}>"),
+                    ]
+                )
+            ],
         )
         return request_channel, personal_folder, request_message, folder_message
 
@@ -299,16 +327,29 @@ class LinkedRequestFlowTests(unittest.IsolatedAsyncioTestCase):
         self.guild.text_channels.extend([unrelated_channel, personal_folder])
         folder_message = message(
             personal_folder,
-            [embed([("Kanál žádosti", f"<#{REQUEST_CHANNEL_ID}>")])],
+            [
+                embed(
+                    [
+                        ("Uživatel", f"<@{MEMBER_ID}>"),
+                        ("Kanál žádosti", f"<#{REQUEST_CHANNEL_ID}>"),
+                    ]
+                )
+            ],
         )
 
         with patch("ticket_renamer.bot.discord.TextChannel", FakeTextChannel):
             changed = await self.client._maybe_rename_from_message(folder_message)
 
-        self.assertFalse(changed)
+        self.assertTrue(changed)
         self.assertEqual(personal_folder.name, "ticket-91")
-        self.assertEqual(personal_folder.sent_messages, [])
-        self.assertEqual(self.events[-1].title, "Neplatný kanál žádosti")
+        self.assertEqual(len(personal_folder.sent_messages), 1)
+        record = parse_manual_fallback_embed(personal_folder.sent_messages[0].embeds[0])
+        self.assertIsNotNone(record)
+        self.assertEqual(record.marker.state, ManualFallbackState.WAITING)
+        self.assertEqual(
+            [event.title for event in self.events][-2:],
+            ["Neplatný kanál žádosti", "Žádost vyžaduje ruční doplnění"],
+        )
 
 
 if __name__ == "__main__":

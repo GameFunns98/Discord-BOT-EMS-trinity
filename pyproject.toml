@@ -1,15 +1,22 @@
 [project]
 name = "discord-ticket-renamer"
-version = "2.4.0"
+version = "2.5.0"
 description = "Discord bot pro prejmenovani a vyplneni osobnich slozek podle propojene zadosti."
 requires-python = ">=3.11"
 dependencies = [
     "discord.py>=2.6,<3",
     "aiohttp>=3.9,<4",
     "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+windows = [
     "pystray>=0.19.5,<1",
     "Pillow>=10,<13",
 ]
+
+[project.scripts]
+ticket-renamer = "ticket_renamer.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

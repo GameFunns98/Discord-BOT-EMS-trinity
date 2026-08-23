@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DATA_HOME="$HOME/.local/share"
+CURRENT="$DATA_HOME/discord-ticket-renamer/current"
+PYTHON="$CURRENT/.venv/bin/python"
+
+usage() {
+    cat <<'EOF'
+Pouziti: ticket-renamer <prikaz>
+
+  status       Strucny stav bota a posledni udalosti
+  logs         Sledovat bezpecny provozni log
+  restart      Restartovat bota
+  update-now   Okamzite zkontrolovat GitHub Release
+  doctor       Zkontrolovat instalaci a konfiguraci
+  version      Vypsat nainstalovanou verzi
+  run          Spustit bota v aktualnim terminalu
+EOF
+}
+
+if (($# == 0)); then
+    set -- status
+fi
+command="$1"
+case "$command" in
+    run)
+        if systemctl --user is-active --quiet discord-ticket-renamer.service; then
+            echo "Systemd sluzba uz bezi. Nejprve ji zastavte: systemctl --user stop discord-ticket-renamer.service" >&2
+            exit 1
+        fi
+        ;;
+    -h|--help|help)
+        usage >&2
+        exit 0
+        ;;
+esac
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "Aktivni instalace nebo jeji virtualni prostredi chybi." >&2
+    exit 1
+fi
+exec "$PYTHON" -m ticket_renamer "$@"

@@ -48,8 +48,11 @@ def self_test() -> None:
     async def validate_discord_client() -> None:
         client = TicketRenamerClient(settings)
         try:
-            if client.tree.get_command("sluzebni-panel") is None:
-                raise RuntimeError("Příkaz /sluzebni-panel nebyl zaregistrován.")
+            for command_name in ("sluzebni-panel", "doplnit-zadost"):
+                if client.tree.get_command(command_name) is None:
+                    raise RuntimeError(
+                        f"Příkaz /{command_name} nebyl zaregistrován."
+                    )
         finally:
             await client.close()
 
