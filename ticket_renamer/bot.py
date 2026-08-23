@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
+import re
 
 import discord
 from discord import app_commands
@@ -76,7 +77,17 @@ from .shift_panel import (
 LOGGER = logging.getLogger("ticket_renamer")
 EMPLOYEE_INFO_FOOTER_PREFIX = "Discord Ticket Renamer • Základní informace"
 EMPLOYEE_INFO_HISTORY_LIMIT = 100
+ONBOARDING_HISTORY_LIMIT: int | None = None
 FIVEROSTER_NAME_PREFIX = "**Nastavte jméno ve FiveRosteru na:**"
+FIVEROSTER_RADIO_PREFIX = "**Ve hře použijte:**"
+FIVEROSTER_CALLSIGN_PLACEHOLDER = "[volačka]"
+FIVEROSTER_NAME_HISTORY_LIMIT: int | None = None
+FIVEROSTER_NAME_MARKER_PREFIX = "Discord Ticket Renamer • Radio"
+FIVEROSTER_NAME_MARKER_VERSION = 1
+FIVEROSTER_NAME_MARKER_PATTERN = re.compile(
+    r"member:(?P<member_id>\d+)\s*•\s*v:(?P<version>\d+)"
+)
+PIN_MESSAGES_PERMISSION_BIT = 1 << 51
 # Pokud panel není připnutý, musí se projít celá historie. Omezené hledání by
 # po delší době mohlo založit druhý panel a porušit idempotenci.
 SHIFT_PANEL_HISTORY_LIMIT: int | None = None
@@ -89,6 +100,13 @@ class OnboardingExecutionResult:
     action: EnrollmentAction
     detail: str
     actor_id: int | None = None
+    callsign: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FiveRosterNameMarker:
+    member_id: int
+    version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +137,97 @@ class ManualFallbackLookupError(RuntimeError):
     pass
 
 
+class FiveRosterNameLookupError(RuntimeError):
+    pass
+
+
 def _embed_field_value(value: str) -> str:
     cleaned = str(value or "").strip()
     return (cleaned or "Neuvedeno")[:1024]
+
+
+def _pin_messages_preflight(permissions: object | None) -> bool | None:
+    """Return an explicit pin decision across discord.py 2.6 and 2.7+.
+
+    Discord split PIN_MESSAGES from MANAGE_MESSAGES. discord.py 2.6 retains
+    the raw permission integer but does not expose ``pin_messages`` by name.
+    ``None`` means the local object cannot decide and the REST request should
+    be attempted so Discord remains authoritative.
+    """
+
+    if permissions is None:
+        return None
+    if bool(getattr(permissions, "administrator", False)):
+        return True
+    explicit = getattr(permissions, "pin_messages", None)
+    if explicit is not None:
+        return bool(explicit)
+    raw_value = getattr(permissions, "value", None)
+    if isinstance(raw_value, int):
+        return bool(raw_value & PIN_MESSAGES_PERMISSION_BIT)
+    return None
+
+
+def _build_fiveroster_name_marker_embed(member_id: int) -> discord.Embed:
+    embed = discord.Embed(colour=discord.Colour.from_rgb(59, 130, 246))
+    embed.set_footer(
+        text=(
+            f"{FIVEROSTER_NAME_MARKER_PREFIX} • member:{member_id} "
+            f"• v:{FIVEROSTER_NAME_MARKER_VERSION}"
+        )
+    )
+    return embed
+
+
+def _parse_fiveroster_name_marker(embed: discord.Embed) -> FiveRosterNameMarker | None:
+    footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "")
+    if not footer_text.startswith(FIVEROSTER_NAME_MARKER_PREFIX):
+        return None
+    match = FIVEROSTER_NAME_MARKER_PATTERN.search(footer_text)
+    if match is None:
+        return None
+    return FiveRosterNameMarker(
+        member_id=int(match.group("member_id")),
+        version=int(match.group("version")),
+    )
+
+
+def _has_fiveroster_name_marker_footer(embed: discord.Embed) -> bool:
+    footer_text = str(getattr(getattr(embed, "footer", None), "text", "") or "")
+    return footer_text.startswith(FIVEROSTER_NAME_MARKER_PREFIX)
+
+
+def _fiveroster_name_marker_from_message(
+    message: discord.Message,
+) -> FiveRosterNameMarker | None:
+    for embed in getattr(message, "embeds", ()):
+        marker = _parse_fiveroster_name_marker(embed)
+        if marker is not None:
+            return marker
+    return None
+
+
+def _fiveroster_name_content(full_name: str, callsign: str | None) -> str | None:
+    suggestion = abbreviate_person_name(full_name)
+    if not suggestion:
+        return None
+
+    safe_suggestion = suggestion.replace("`", "'").replace("\r", " ").replace("\n", " ")
+    normalized_callsign = " ".join(str(callsign or "").split())
+    if not normalized_callsign or len(normalized_callsign) > 64 or "`" in normalized_callsign:
+        normalized_callsign = FIVEROSTER_CALLSIGN_PLACEHOLDER
+
+    content = (
+        f"{FIVEROSTER_NAME_PREFIX}\n```\n{safe_suggestion}\n```\n"
+        f"{FIVEROSTER_RADIO_PREFIX}\n```\n"
+        f"/nameinradio {normalized_callsign} {safe_suggestion}\n```"
+    )
+    if normalized_callsign == FIVEROSTER_CALLSIGN_PLACEHOLDER:
+        content += (
+            "\n*FiveRoster nevrátil konkrétní volačku. Před použitím příkazu "
+            "nahraďte `[volačka]` skutečnou hodnotou.*"
+        )
+    return content
 
 
 def build_employee_info_embed(
@@ -181,6 +287,7 @@ class TicketRenamerClient(discord.Client):
         self.settings = settings
         self._reporter = reporter
         self._channel_locks: dict[int, asyncio.Lock] = {}
+        self._name_message_locks: dict[int, asyncio.Lock] = {}
         self._shift_locks: dict[int, asyncio.Lock] = {}
         self._shift_snapshot_cache: dict[int, tuple[float, ShiftPanelSnapshot]] = {}
         self._roster_loa_cache: tuple[float, tuple[LoaRequest, ...]] | None = None
@@ -423,7 +530,107 @@ class TicketRenamerClient(discord.Client):
             await asyncio.sleep(60)
 
     async def on_message(self, message: discord.Message) -> None:
+        if await self._cleanup_new_pin_notice(message):
+            return
         await self._maybe_rename_from_message(message)
+
+    def _report_pin_notice_cleanup_failure(
+        self,
+        channel: discord.TextChannel,
+        detail: str,
+    ) -> None:
+        LOGGER.warning(
+            "Systemovou hlasku o pripnuti nelze odstranit v kanalu %s: %s",
+            channel.id,
+            detail,
+        )
+        self._report(
+            AppEvent(
+                EventLevel.WARNING,
+                "Hlášku o připnutí nelze odstranit",
+                (
+                    "Bot nemohl odstranit novou systémovou hlášku o připnutí své zprávy. "
+                    "Připnutá zpráva zůstala beze změny; zkontrolujte oprávnění "
+                    "Spravovat zprávy."
+                ),
+                status="Připojeno – upozornění Discordu",
+            )
+        )
+
+    async def _cleanup_new_pin_notice(self, message: discord.Message) -> bool:
+        """Delete only a newly delivered pin notice for this bot's own message.
+
+        This runs solely from ``on_message`` and never walks channel history, so
+        notices which existed before startup are intentionally left untouched.
+        """
+
+        if getattr(message, "type", None) != discord.MessageType.pins_add:
+            return False
+        channel = getattr(message, "channel", None)
+        if not self._is_rename_target_channel(channel):
+            return False
+
+        reference = getattr(message, "reference", None)
+        target_message_id = getattr(reference, "message_id", None)
+        if not isinstance(target_message_id, int) or target_message_id <= 0:
+            return False
+        reference_channel_id = getattr(reference, "channel_id", None)
+        if reference_channel_id is not None and reference_channel_id != channel.id:
+            return False
+
+        try:
+            target_message = await channel.fetch_message(target_message_id)
+        except discord.NotFound:
+            return True
+        except discord.Forbidden:
+            self._report_pin_notice_cleanup_failure(
+                channel,
+                "Discord zakázal ověření odkazované zprávy.",
+            )
+            return True
+        except discord.HTTPException:
+            self._report_pin_notice_cleanup_failure(
+                channel,
+                "Discord nevrátil odkazovanou zprávu.",
+            )
+            return True
+
+        bot_user_id = getattr(self.user, "id", None)
+        if bot_user_id is None or getattr(target_message.author, "id", None) != bot_user_id:
+            return False
+
+        bot_member = channel.guild.me
+        permissions = channel.permissions_for(bot_member) if bot_member is not None else None
+        if permissions is not None and not (
+            bool(getattr(permissions, "administrator", False))
+            or bool(getattr(permissions, "manage_messages", False))
+        ):
+            self._report_pin_notice_cleanup_failure(
+                channel,
+                "Chybí oprávnění Spravovat zprávy.",
+            )
+            return True
+
+        try:
+            await message.delete()
+        except discord.NotFound:
+            return True
+        except discord.Forbidden:
+            self._report_pin_notice_cleanup_failure(
+                channel,
+                "Discord zakázal odstranění systémové hlášky.",
+            )
+        except discord.HTTPException:
+            self._report_pin_notice_cleanup_failure(
+                channel,
+                "Discord systémovou hlášku neodstranil.",
+            )
+        else:
+            LOGGER.info(
+                "Nova systemova hlaska o pripnuti botovy zpravy byla odstranena v kanalu %s.",
+                channel.id,
+            )
+        return True
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         if payload.guild_id is None:
@@ -1528,7 +1735,7 @@ class TicketRenamerClient(discord.Client):
         bot_user_id = getattr(self.user, "id", None)
         try:
             async for candidate in channel.history(
-                limit=EMPLOYEE_INFO_HISTORY_LIMIT,
+                limit=ONBOARDING_HISTORY_LIMIT,
                 oldest_first=False,
             ):
                 if bot_user_id is None or candidate.author.id != bot_user_id:
@@ -1630,67 +1837,263 @@ class TicketRenamerClient(discord.Client):
             )
         return False
 
+    async def _find_fiveroster_name_message(
+        self,
+        channel: discord.TextChannel,
+        member_id: int,
+    ) -> discord.Message | None:
+        bot_user_id = getattr(self.user, "id", None)
+        candidates: dict[int, discord.Message] = {}
+
+        async def collect(iterator: object) -> None:
+            async for candidate in iterator:  # type: ignore[union-attr]
+                candidate_id = int(getattr(candidate, "id", 0) or 0)
+                if candidate_id > 0:
+                    candidates.setdefault(candidate_id, candidate)
+
+        pins_method = getattr(channel, "pins", None)
+        if callable(pins_method):
+            try:
+                await collect(pins_method(limit=250, oldest_first=False))
+            except (discord.Forbidden, discord.HTTPException):
+                LOGGER.warning(
+                    "Pripnute zpravy se jmenem neslo nacist v kanalu %s; zkousim historii.",
+                    channel.id,
+                )
+
+        try:
+            await collect(
+                channel.history(
+                    limit=FIVEROSTER_NAME_HISTORY_LIMIT,
+                    oldest_first=False,
+                )
+            )
+        except discord.Forbidden as exc:
+            LOGGER.error("Bot nema historii pro prikaz se jmenem v kanalu %s.", channel.id)
+            raise FiveRosterNameLookupError(
+                "Bot nemůže číst historii osobní složky."
+            ) from exc
+        except discord.HTTPException as exc:
+            LOGGER.exception("Hledani prikazu se jmenem selhalo v kanalu %s.", channel.id)
+            raise FiveRosterNameLookupError(
+                "Discord nevrátil historii osobní složky."
+            ) from exc
+
+        matching: list[discord.Message] = []
+        foreign: list[FiveRosterNameMarker] = []
+        legacy: list[discord.Message] = []
+        invalid_marker = False
+        future_marker = False
+
+        for candidate in candidates.values():
+            if bot_user_id is None or getattr(candidate.author, "id", None) != bot_user_id:
+                continue
+            marker_embeds = [
+                embed
+                for embed in getattr(candidate, "embeds", ())
+                if _has_fiveroster_name_marker_footer(embed)
+            ]
+            if marker_embeds:
+                parsed_markers = [
+                    _parse_fiveroster_name_marker(embed) for embed in marker_embeds
+                ]
+                if len(parsed_markers) != 1 or parsed_markers[0] is None:
+                    invalid_marker = True
+                    continue
+                marker = parsed_markers[0]
+                if marker.version > FIVEROSTER_NAME_MARKER_VERSION:
+                    future_marker = True
+                elif marker.member_id == member_id:
+                    matching.append(candidate)
+                else:
+                    foreign.append(marker)
+                continue
+
+            if str(getattr(candidate, "content", "") or "").startswith(
+                FIVEROSTER_NAME_PREFIX
+            ):
+                legacy.append(candidate)
+
+        if future_marker:
+            raise FiveRosterNameLookupError(
+                "Kanál obsahuje zprávu /nameinradio z novější verze bota. "
+                "Automatická změna byla zastavena."
+            )
+        if invalid_marker:
+            raise FiveRosterNameLookupError(
+                "Kanál obsahuje poškozený marker zprávy /nameinradio. "
+                "Automatická změna byla zastavena."
+            )
+        if foreign:
+            raise FiveRosterNameLookupError(
+                "Kanál už obsahuje zprávu /nameinradio svázanou s jiným "
+                "Discord uživatelem."
+            )
+        if len(matching) > 1 or (matching and legacy) or len(legacy) > 1:
+            raise FiveRosterNameLookupError(
+                "Kanál obsahuje více zpráv /nameinradio. Duplicitní stav je "
+                "nutné zkontrolovat ručně."
+            )
+        if matching:
+            return matching[0]
+        if legacy:
+            return legacy[0]
+        return None
+
+    async def _pin_fiveroster_name_message(
+        self,
+        channel: discord.TextChannel,
+        message: discord.Message,
+    ) -> tuple[bool, str | None]:
+        if bool(getattr(message, "pinned", False)):
+            return False, None
+
+        bot_member = channel.guild.me
+        permissions = channel.permissions_for(bot_member) if bot_member is not None else None
+        if _pin_messages_preflight(permissions) is False:
+            return False, "Bot nemá v osobní složce oprávnění Připínat zprávy."
+
+        try:
+            await message.pin(reason="Pripnuti prikazu /nameinradio zamestnance")
+            return True, None
+        except discord.Forbidden:
+            return False, "Discord zakázal připnutí příkazu /nameinradio."
+        except discord.HTTPException:
+            LOGGER.exception("Pripnuti prikazu se jmenem %s selhalo.", message.id)
+            return False, "Discord zprávu s příkazem /nameinradio nepřipnul."
+
+    def _report_fiveroster_name_failure(
+        self,
+        channel: discord.TextChannel,
+        detail: str,
+    ) -> None:
+        LOGGER.error("Prikaz se jmenem v kanalu %s selhal: %s", channel.id, detail)
+        self._report(
+            AppEvent(
+                EventLevel.ERROR,
+                "Příkaz /nameinradio vyžaduje kontrolu",
+                f"{channel.name}: {detail}",
+                status="Připojeno – chyba příkazu se jménem",
+            )
+        )
+
+    async def _load_fiveroster_callsign(
+        self,
+        channel: discord.TextChannel,
+        member_id: int,
+    ) -> tuple[bool, str | None]:
+        if self._fiveroster is None:
+            return False, None
+        try:
+            return True, await self._fiveroster.get_player_callsign(member_id)
+        except FiveRosterError:
+            self._report_fiveroster_name_failure(
+                channel,
+                "FiveRoster nyní nevrátil volačku; existující zpráva zůstala beze změny.",
+            )
+            return False, None
+
     async def _upsert_fiveroster_name_message(
         self,
         channel: discord.TextChannel,
         full_name: str,
+        member_id: int,
+        *,
+        callsign: str | None,
     ) -> bool:
-        suggestion = abbreviate_person_name(full_name)
-        if not suggestion:
+        lock = self._name_message_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            return await self._upsert_fiveroster_name_message_locked(
+                channel,
+                full_name,
+                member_id,
+                callsign=callsign,
+            )
+
+    async def _upsert_fiveroster_name_message_locked(
+        self,
+        channel: discord.TextChannel,
+        full_name: str,
+        member_id: int,
+        *,
+        callsign: str | None,
+    ) -> bool:
+        content = _fiveroster_name_content(full_name, callsign)
+        if content is None:
             return False
-        safe_suggestion = suggestion.replace("`", "'").replace("\r", " ").replace("\n", " ")
-        content = f"{FIVEROSTER_NAME_PREFIX}\n```\n{safe_suggestion}\n```"
-        existing_message: discord.Message | None = None
-        bot_user_id = getattr(self.user, "id", None)
+        marker_embed = _build_fiveroster_name_marker_embed(member_id)
 
         try:
-            async for candidate in channel.history(
-                limit=EMPLOYEE_INFO_HISTORY_LIMIT,
-                oldest_first=False,
-            ):
-                if bot_user_id is None or candidate.author.id != bot_user_id:
-                    continue
-                if str(getattr(candidate, "content", "") or "").startswith(
-                    FIVEROSTER_NAME_PREFIX
-                ):
-                    existing_message = candidate
-                    break
-        except (discord.Forbidden, discord.HTTPException):
-            LOGGER.exception("Nepodarilo se najit zpravu s FiveRoster jmenem v kanalu %s.", channel.id)
+            existing_message = await self._find_fiveroster_name_message(
+                channel,
+                member_id,
+            )
+        except FiveRosterNameLookupError as exc:
+            self._report_fiveroster_name_failure(channel, str(exc))
             return False
 
+        changed = False
         if existing_message is not None:
-            if existing_message.content == content:
-                return False
+            marker = _fiveroster_name_marker_from_message(existing_message)
+            marker_is_current = bool(
+                marker is not None
+                and marker.member_id == member_id
+                and marker.version == FIVEROSTER_NAME_MARKER_VERSION
+                and len(getattr(existing_message, "embeds", ())) == 1
+                and existing_message.embeds[0].to_dict() == marker_embed.to_dict()
+            )
+            if existing_message.content != content or not marker_is_current:
+                try:
+                    message = await existing_message.edit(
+                        content=content,
+                        embed=marker_embed,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    changed = True
+                except discord.Forbidden:
+                    self._report_fiveroster_name_failure(
+                        channel,
+                        "Bot nemůže upravit existující zprávu s příkazem.",
+                    )
+                    return False
+                except discord.HTTPException:
+                    LOGGER.exception(
+                        "FiveRoster prikaz se nepodarilo aktualizovat v kanalu %s.",
+                        channel.id,
+                    )
+                    self._report_fiveroster_name_failure(
+                        channel,
+                        "Discord neuložil aktualizovaný příkaz /nameinradio.",
+                    )
+                    return False
+            else:
+                message = existing_message
+        else:
             try:
-                await existing_message.edit(
+                message = await channel.send(
                     content=content,
+                    embed=marker_embed,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-                return True
-            except (discord.Forbidden, discord.HTTPException):
-                LOGGER.exception("FiveRoster jmeno se nepodarilo aktualizovat v kanalu %s.", channel.id)
+                changed = True
+            except discord.Forbidden:
+                self._report_fiveroster_name_failure(
+                    channel,
+                    "Bot nemůže poslat kopírovatelný příkaz do osobní složky.",
+                )
+                return False
+            except discord.HTTPException:
+                LOGGER.exception("Discord neodeslal prikaz se jmenem do kanalu %s.", channel.id)
+                self._report_fiveroster_name_failure(
+                    channel,
+                    "Discord neodeslal příkaz /nameinradio.",
+                )
                 return False
 
-        try:
-            await channel.send(
-                content=content,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
-        except discord.Forbidden:
-            LOGGER.error("Discord zakazal odeslani navrhu jmena do kanalu %s.", channel.id)
-            self._report(
-                AppEvent(
-                    EventLevel.ERROR,
-                    "Návrh jména nelze odeslat",
-                    f"Bot nemůže poslat kopírovatelné jméno do kanálu {channel.name}.",
-                    status="Připojeno – chyba oprávnění",
-                )
-            )
-        except discord.HTTPException:
-            LOGGER.exception("Discord neodeslal navrh jmena do kanalu %s.", channel.id)
-        return False
+        pinned, pin_error = await self._pin_fiveroster_name_message(channel, message)
+        if pin_error is not None:
+            self._report_fiveroster_name_failure(channel, pin_error)
+        return changed or pinned
 
     def _result_embed(
         self,
@@ -1870,16 +2273,8 @@ class TicketRenamerClient(discord.Client):
 
         bot_member = channel.guild.me
         permissions = channel.permissions_for(bot_member) if bot_member is not None else None
-        if permissions is not None:
-            can_pin = bool(
-                getattr(
-                    permissions,
-                    "pin_messages",
-                    getattr(permissions, "manage_messages", False),
-                )
-            )
-            if not can_pin:
-                return False, "Bot nemá v osobní složce oprávnění Připínat zprávy."
+        if _pin_messages_preflight(permissions) is False:
+            return False, "Bot nemá v osobní složce oprávnění Připínat zprávy."
 
         try:
             await message.pin(reason="Pripnuti sluzebniho panelu zamestnance")
@@ -2048,13 +2443,8 @@ class TicketRenamerClient(discord.Client):
             return False
 
         existing_message, marker = await self._find_onboarding_message(channel)
-        name_changed = False
 
         if existing_message is not None and marker is not None:
-            name_changed = await self._upsert_fiveroster_name_message(
-                channel,
-                ticket_form.full_name,
-            )
             if marker.state in {OnboardingState.COMPLETED, OnboardingState.PARTIAL}:
                 if marker.member_id != member_id:
                     self._report(
@@ -2068,7 +2458,19 @@ class TicketRenamerClient(discord.Client):
                             status="Připojeno – vyžaduje kontrolu",
                         )
                     )
-                    return name_changed
+                    return False
+                callsign_loaded, callsign = await self._load_fiveroster_callsign(
+                    channel,
+                    member_id,
+                )
+                name_changed = False
+                if callsign_loaded:
+                    name_changed = await self._upsert_fiveroster_name_message(
+                        channel,
+                        ticket_form.full_name,
+                        member_id,
+                        callsign=callsign,
+                    )
                 panel_result = await self._upsert_shift_panel(
                     channel,
                     member_id,
@@ -2077,7 +2479,7 @@ class TicketRenamerClient(discord.Client):
                 return name_changed or panel_result.changed
 
             if marker.state is OnboardingState.ERROR:
-                return name_changed
+                return False
 
             if marker.state is OnboardingState.PROCESSING:
                 interrupted = OnboardingExecutionResult(
@@ -2099,10 +2501,10 @@ class TicketRenamerClient(discord.Client):
                         retry_security=(marker.allowed_actions == (EnrollmentAction.SECURITY,)),
                     ),
                 )
-                return edited or name_changed
+                return edited
 
             if marker.member_id == member_id and marker.allowed_actions == actions:
-                return name_changed
+                return False
 
             pending_embed = build_onboarding_embed(
                 full_name=ticket_form.full_name,
@@ -2116,7 +2518,7 @@ class TicketRenamerClient(discord.Client):
                 embed=pending_embed,
                 view=OnboardingView(self._handle_onboarding_interaction, actions),
             )
-            return edited or name_changed
+            return edited
 
         pending_embed = build_onboarding_embed(
             full_name=ticket_form.full_name,
@@ -2130,11 +2532,7 @@ class TicketRenamerClient(discord.Client):
             embed=pending_embed,
             view=OnboardingView(self._handle_onboarding_interaction, actions),
         )
-        name_changed = await self._upsert_fiveroster_name_message(
-            channel,
-            ticket_form.full_name,
-        )
-        return sent is not None or name_changed
+        return sent is not None
 
     def _onboarding_failure(
         self,
@@ -2341,6 +2739,7 @@ class TicketRenamerClient(discord.Client):
                 action=action,
                 detail=detail,
                 actor_id=actor_id,
+                callsign=enrollment.callsign,
             )
         except discord.HTTPException:
             detail = (
@@ -2361,6 +2760,7 @@ class TicketRenamerClient(discord.Client):
                 action=action,
                 detail=detail,
                 actor_id=actor_id,
+                callsign=enrollment.callsign,
             )
 
         if enrollment.already_enrolled:
@@ -2391,6 +2791,7 @@ class TicketRenamerClient(discord.Client):
             action=action,
             detail=detail,
             actor_id=actor_id,
+            callsign=enrollment.callsign,
         )
 
     @staticmethod
@@ -2556,6 +2957,12 @@ class TicketRenamerClient(discord.Client):
             )
             panel_result: ShiftPanelUpsertResult | None = None
             if result.state in {OnboardingState.COMPLETED, OnboardingState.PARTIAL}:
+                await self._upsert_fiveroster_name_message(
+                    channel,
+                    ticket_form.full_name,
+                    marker.member_id,
+                    callsign=result.callsign,
+                )
                 panel_result = await self._upsert_shift_panel(
                     channel,
                     marker.member_id,
@@ -3428,12 +3835,36 @@ class TicketRenamerClient(discord.Client):
                         break
 
                     if self.settings.fiveroster_enabled:
-                        _, onboarding_marker = await self._find_onboarding_message(channel)
+                        onboarding_message, onboarding_marker = (
+                            await self._find_onboarding_message(channel)
+                        )
                         if (
-                            onboarding_marker is not None
+                            onboarding_message is not None
+                            and onboarding_marker is not None
                             and onboarding_marker.state
                             in {OnboardingState.COMPLETED, OnboardingState.PARTIAL}
                         ):
+                            onboarding_data = self._onboarding_data_from_message(
+                                onboarding_message
+                            )
+                            if onboarding_data is not None:
+                                _, ticket_form = onboarding_data
+                                callsign_loaded, callsign = (
+                                    await self._load_fiveroster_callsign(
+                                        channel,
+                                        onboarding_marker.member_id,
+                                    )
+                                )
+                                if callsign_loaded:
+                                    name_changed = (
+                                        await self._upsert_fiveroster_name_message(
+                                            channel,
+                                            ticket_form.full_name,
+                                            onboarding_marker.member_id,
+                                            callsign=callsign,
+                                        )
+                                    )
+                                    channel_changed = channel_changed or name_changed
                             panel_result = await self._upsert_shift_panel(
                                 channel,
                                 onboarding_marker.member_id,

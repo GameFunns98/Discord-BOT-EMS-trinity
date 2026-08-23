@@ -7,7 +7,15 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from ticket_renamer.bot import TicketRenamerClient
+from ticket_renamer.bot import (
+    FIVEROSTER_NAME_MARKER_VERSION,
+    FIVEROSTER_NAME_PREFIX,
+    PIN_MESSAGES_PERMISSION_BIT,
+    TicketRenamerClient,
+    _build_fiveroster_name_marker_embed,
+    _parse_fiveroster_name_marker,
+    _pin_messages_preflight,
+)
 from ticket_renamer.config import Settings
 from ticket_renamer.fiveroster import (
     EnrollmentOutcome,
@@ -90,6 +98,7 @@ class FakeMember:
 class FakeGuild:
     def __init__(self, *, target_fail_edit=False):
         self.id = GUILD_ID
+        self.text_channels = []
         self.default_role = FakeRole(GUILD_ID, "@everyone", 0)
         self.roles = {
             role_id: FakeRole(role_id, f"role-{role_id}", 10 + index)
@@ -125,7 +134,19 @@ class FakeGuild:
 
 
 class FakeMessage:
-    def __init__(self, *, message_id, channel, author_id, content="", embed=None, view=None):
+    def __init__(
+        self,
+        *,
+        message_id,
+        channel,
+        author_id,
+        content="",
+        embed=None,
+        view=None,
+        message_type=discord.MessageType.default,
+        reference=None,
+        delete_error=None,
+    ):
         self.id = message_id
         self.channel = channel
         self.guild = channel.guild
@@ -136,6 +157,10 @@ class FakeMessage:
         self.edit_count = 0
         self.pinned = False
         self.pin_count = 0
+        self.type = message_type
+        self.reference = reference
+        self.delete_error = delete_error
+        self.delete_count = 0
 
     async def edit(
         self,
@@ -158,9 +183,21 @@ class FakeMessage:
         self.pinned = True
         self.pin_count += 1
 
+    async def delete(self):
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.delete_count += 1
+
 
 class FakeChannel:
-    def __init__(self, guild, *, can_pin=True):
+    def __init__(
+        self,
+        guild,
+        *,
+        can_pin=True,
+        can_manage_messages=True,
+        send_delay=0.0,
+    ):
         self.id = 333333333333333333
         self.name = "🚑・fero-lakatos"
         self.category_id = 1511618288373858435
@@ -168,19 +205,33 @@ class FakeChannel:
         self._messages = []
         self._next_message_id = 1
         self.can_pin = can_pin
+        self.can_manage_messages = can_manage_messages
+        self.send_delay = send_delay
+        guild.text_channels.append(self)
 
     def permissions_for(self, member):
         return SimpleNamespace(
             send_messages=True,
             embed_links=True,
             pin_messages=self.can_pin,
-            manage_messages=True,
+            manage_messages=self.can_manage_messages,
             manage_channels=True,
         )
 
     def history(self, *, limit, oldest_first):
         async def iterator():
             messages = self._messages if oldest_first else list(reversed(self._messages))
+            selected = messages if limit is None else messages[:limit]
+            for message in selected:
+                yield message
+
+        return iterator()
+
+    def pins(self, *, limit, oldest_first):
+        async def iterator():
+            messages = [message for message in self._messages if message.pinned]
+            if not oldest_first:
+                messages.reverse()
             for message in messages[:limit]:
                 yield message
 
@@ -194,6 +245,8 @@ class FakeChannel:
         view=None,
         allowed_mentions=None,
     ):
+        if self.send_delay:
+            await asyncio.sleep(self.send_delay)
         message = FakeMessage(
             message_id=self._next_message_id,
             channel=self,
@@ -214,10 +267,11 @@ class FakeChannel:
 
 
 class FakeFiveRoster:
-    def __init__(self, *, error=None, already_enrolled=False, delay=0):
+    def __init__(self, *, error=None, already_enrolled=False, delay=0, callsign="A-01"):
         self.error = error
         self.already_enrolled = already_enrolled
         self.delay = delay
+        self.callsign = callsign
         self.calls = []
         self.closed = False
         self.shift_status = ShiftStatus(on_shift=False)
@@ -243,8 +297,11 @@ class FakeFiveRoster:
         return EnrollmentOutcome(
             rank=FiveRosterRank(rank_key, f"uuid-{rank_key}", EnrollmentAction(rank_key).label),
             already_enrolled=self.already_enrolled,
-            callsign="A-01" if not self.already_enrolled else None,
+            callsign=self.callsign,
         )
+
+    async def get_player_callsign(self, member_id):
+        return self.callsign
 
     async def is_player_enrolled(self, member_id):
         return True
@@ -365,6 +422,22 @@ def shift_marker_from(message):
     return parse_shift_panel_marker(message.embeds[0]) if message.embeds else None
 
 
+def name_command_messages(channel):
+    return [
+        message
+        for message in channel._messages
+        if message.content.startswith(FIVEROSTER_NAME_PREFIX)
+    ]
+
+
+def name_marker_from(message):
+    for embed in message.embeds:
+        marker = _parse_fiveroster_name_marker(embed)
+        if marker is not None:
+            return marker
+    return None
+
+
 class OnboardingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.events = []
@@ -416,7 +489,52 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({item.custom_id for item in view.children}), 5)
         self.assertIsNotNone(self.client.tree.get_command("sluzebni-panel"))
 
-    async def test_pending_buttons_and_name_message_are_idempotent(self):
+    def test_pin_messages_preflight_uses_discord_py_27_attribute(self):
+        granted = SimpleNamespace(
+            administrator=False,
+            pin_messages=True,
+            value=0,
+        )
+        denied = SimpleNamespace(
+            administrator=False,
+            pin_messages=False,
+            value=PIN_MESSAGES_PERMISSION_BIT,
+        )
+
+        self.assertIs(_pin_messages_preflight(granted), True)
+        self.assertIs(_pin_messages_preflight(denied), False)
+
+    def test_pin_messages_preflight_reads_raw_bit_51(self):
+        permissions = SimpleNamespace(
+            administrator=False,
+            value=PIN_MESSAGES_PERMISSION_BIT,
+        )
+
+        self.assertIs(_pin_messages_preflight(permissions), True)
+
+    def test_pin_messages_preflight_rejects_manage_messages_only(self):
+        permissions = SimpleNamespace(
+            administrator=False,
+            manage_messages=True,
+            value=1 << 13,
+        )
+
+        self.assertIs(_pin_messages_preflight(permissions), False)
+
+    def test_pin_messages_preflight_accepts_administrator(self):
+        permissions = SimpleNamespace(
+            administrator=True,
+            pin_messages=False,
+            value=0,
+        )
+
+        self.assertIs(_pin_messages_preflight(permissions), True)
+
+    def test_pin_messages_preflight_returns_unknown_without_permission_data(self):
+        self.assertIsNone(_pin_messages_preflight(None))
+        self.assertIsNone(_pin_messages_preflight(object()))
+
+    async def test_pending_buttons_are_idempotent_without_name_command(self):
         form = TicketForm("Fero Lakatoš", "Záchranář")
 
         first = await self.client._upsert_onboarding(self.channel, form, MEMBER_ID)
@@ -424,14 +542,14 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(first)
         self.assertFalse(second)
-        self.assertEqual(len(self.channel._messages), 2)
-        onboarding_message, name_message = self.channel._messages
+        self.assertEqual(len(self.channel._messages), 1)
+        onboarding_message = self.channel._messages[0]
         self.assertEqual(marker_from(onboarding_message).state, OnboardingState.PENDING)
         self.assertEqual(
             [item.label for item in onboarding_message.view.children],
             ["Paramedic", "Akademie"],
         )
-        self.assertIn("F. Lakatoš", name_message.content)
+        self.assertEqual(name_command_messages(self.channel), [])
 
     async def test_security_requires_operator_confirmation(self):
         changed = await self.client._upsert_onboarding(
@@ -545,6 +663,196 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item.disabled for item in onboarding_message.view.children))
         self.assertEqual(self.fiveroster.calls, [(MEMBER_ID, "paramedic")])
         self.assertIn("Hotovo", interaction.followup.messages[-1][0])
+        commands = name_command_messages(self.channel)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("/nameinradio A-01 F. Lakatoš", commands[0].content)
+        self.assertTrue(commands[0].pinned)
+        self.assertEqual(commands[0].pin_count, 1)
+        radio_marker = name_marker_from(commands[0])
+        self.assertIsNotNone(radio_marker)
+        self.assertEqual(radio_marker.member_id, MEMBER_ID)
+        self.assertEqual(radio_marker.version, FIVEROSTER_NAME_MARKER_VERSION)
+
+    async def test_name_command_uses_literal_placeholder_only_when_callsign_missing(self):
+        self.fiveroster.callsign = None
+        await self.client._upsert_onboarding(
+            self.channel,
+            TicketForm("Fero Lakatoš", "Ochranka"),
+            MEMBER_ID,
+        )
+        onboarding_message = self.channel._messages[0]
+        interaction = FakeInteraction(
+            guild=self.guild,
+            channel=self.channel,
+            message=onboarding_message,
+            role_ids=(OPERATOR_ROLE_ID,),
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            await self.client._handle_onboarding_interaction(
+                interaction,
+                EnrollmentAction.SECURITY,
+            )
+
+        command = name_command_messages(self.channel)[0]
+        self.assertIn("/nameinradio [volačka] F. Lakatoš", command.content)
+        self.assertIn("nevrátil konkrétní volačku", command.content)
+        self.assertTrue(command.pinned)
+
+    async def test_name_command_survives_failed_final_onboarding_embed_edit(self):
+        await self.client._upsert_onboarding(
+            self.channel,
+            TicketForm("Fero Lakatoš", "Ochranka"),
+            MEMBER_ID,
+        )
+        onboarding_message = self.channel._messages[0]
+        interaction = FakeInteraction(
+            guild=self.guild,
+            channel=self.channel,
+            message=onboarding_message,
+            role_ids=(OPERATOR_ROLE_ID,),
+        )
+
+        with (
+            patch("ticket_renamer.bot.discord.TextChannel", FakeChannel),
+            patch.object(
+                self.client,
+                "_edit_onboarding_message",
+                AsyncMock(side_effect=[True, False]),
+            ),
+        ):
+            await self.client._handle_onboarding_interaction(
+                interaction,
+                EnrollmentAction.SECURITY,
+            )
+
+        command = name_command_messages(self.channel)[0]
+        self.assertIn("/nameinradio A-01 F. Lakatoš", command.content)
+        self.assertTrue(command.pinned)
+        self.assertIn("Stav tlačítek se ale nepodařilo uložit", interaction.followup.messages[-1][0])
+
+    async def test_name_command_is_found_beyond_100_messages_after_restart(self):
+        await self._complete_security_onboarding()
+        command = name_command_messages(self.channel)[0]
+        command.pinned = False
+        for index in range(110):
+            await self.channel.send(content=f"provozní zpráva {index}")
+
+        restarted = TicketRenamerClient(
+            settings(),
+            reporter=self.events.append,
+            fiveroster_client=self.fiveroster,
+        )
+        restarted._connection.user = SimpleNamespace(id=BOT_ID)
+        try:
+            changed = await restarted._upsert_fiveroster_name_message(
+                self.channel,
+                "Fero Lakatoš",
+                MEMBER_ID,
+                callsign="A-01",
+            )
+        finally:
+            await restarted.close()
+
+        self.assertTrue(changed)
+        self.assertEqual(len(name_command_messages(self.channel)), 1)
+        self.assertTrue(command.pinned)
+        self.assertEqual(command.pin_count, 2)
+
+    async def test_name_command_migrates_single_legacy_prefix_message(self):
+        legacy = await self.channel.send(
+            content=f"{FIVEROSTER_NAME_PREFIX}\n```\nF. Lakatoš\n```"
+        )
+
+        changed = await self.client._upsert_fiveroster_name_message(
+            self.channel,
+            "Fero Lakatoš",
+            MEMBER_ID,
+            callsign="A-01",
+        )
+
+        commands = name_command_messages(self.channel)
+        self.assertTrue(changed)
+        self.assertEqual(commands, [legacy])
+        self.assertEqual(legacy.edit_count, 1)
+        self.assertIn("/nameinradio A-01 F. Lakatoš", legacy.content)
+        self.assertTrue(legacy.pinned)
+        marker = name_marker_from(legacy)
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker.member_id, MEMBER_ID)
+        self.assertEqual(marker.version, FIVEROSTER_NAME_MARKER_VERSION)
+
+    async def test_name_command_foreign_member_marker_stops_update(self):
+        foreign_member_id = 987654321098765432
+        foreign = await self.channel.send(
+            content=f"{FIVEROSTER_NAME_PREFIX}\n```\nCizí jméno\n```",
+            embed=_build_fiveroster_name_marker_embed(foreign_member_id),
+        )
+        original_content = foreign.content
+
+        changed = await self.client._upsert_fiveroster_name_message(
+            self.channel,
+            "Fero Lakatoš",
+            MEMBER_ID,
+            callsign="A-01",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(name_command_messages(self.channel), [foreign])
+        self.assertEqual(foreign.content, original_content)
+        self.assertEqual(foreign.edit_count, 0)
+        self.assertFalse(foreign.pinned)
+        self.assertEqual(self.events[-1].title, "Příkaz /nameinradio vyžaduje kontrolu")
+        self.assertIn("jiným Discord uživatelem", self.events[-1].message)
+
+    async def test_multiple_legacy_name_messages_stop_without_creating_another(self):
+        first = await self.channel.send(
+            content=f"{FIVEROSTER_NAME_PREFIX}\n```\nF. První\n```"
+        )
+        second = await self.channel.send(
+            content=f"{FIVEROSTER_NAME_PREFIX}\n```\nF. Druhý\n```"
+        )
+
+        changed = await self.client._upsert_fiveroster_name_message(
+            self.channel,
+            "Fero Lakatoš",
+            MEMBER_ID,
+            callsign="A-01",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(name_command_messages(self.channel), [first, second])
+        self.assertEqual(first.edit_count, 0)
+        self.assertEqual(second.edit_count, 0)
+        self.assertIsNone(name_marker_from(first))
+        self.assertIsNone(name_marker_from(second))
+        self.assertEqual(self.events[-1].title, "Příkaz /nameinradio vyžaduje kontrolu")
+        self.assertIn("více zpráv", self.events[-1].message)
+
+    async def test_concurrent_name_message_upserts_create_only_one_message(self):
+        self.channel.send_delay = 0.02
+
+        results = await asyncio.gather(
+            self.client._upsert_fiveroster_name_message(
+                self.channel,
+                "Fero Lakatoš",
+                MEMBER_ID,
+                callsign="A-01",
+            ),
+            self.client._upsert_fiveroster_name_message(
+                self.channel,
+                "Fero Lakatoš",
+                MEMBER_ID,
+                callsign="A-01",
+            ),
+        )
+
+        commands = name_command_messages(self.channel)
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(commands[0].pinned)
+        self.assertEqual(commands[0].pin_count, 1)
+        self.assertEqual(name_marker_from(commands[0]).member_id, MEMBER_ID)
 
     async def test_api_failure_keeps_rank_buttons_enabled(self):
         self.fiveroster.error = FiveRosterError("API je nedostupné")
@@ -613,6 +921,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.state, OnboardingState.PARTIAL)
+        self.assertEqual(result.callsign, "A-01")
         self.assertEqual(self.fiveroster.calls, [(MEMBER_ID, "paramedic")])
         self.assertIn("opravte ručně", result.detail)
 
@@ -640,6 +949,9 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(marker_from(onboarding_message).state, OnboardingState.PARTIAL)
         panel = next(message for message in self.channel._messages if shift_marker_from(message))
         self.assertTrue(panel.pinned)
+        command = name_command_messages(self.channel)[0]
+        self.assertIn("/nameinradio A-01 F. Lakatoš", command.content)
+        self.assertTrue(command.pinned)
 
     async def test_existing_same_rank_still_synchronizes_roles(self):
         self.fiveroster.already_enrolled = True
@@ -653,6 +965,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.state, OnboardingState.COMPLETED)
+        self.assertEqual(result.callsign, "A-01")
         self.assertIn("už byl", result.detail)
         self.assertEqual(len(self.guild.target.edits), 1)
 
@@ -666,6 +979,229 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(panels[0].pinned)
         self.assertEqual(panels[0].pin_count, 1)
         self.assertEqual(shift_marker_from(panels[0]).member_id, MEMBER_ID)
+
+    async def test_new_manual_pin_notice_for_bot_message_deletes_only_notice(self):
+        target = await self.channel.send(content="bot panel")
+        target.pinned = True
+        notice = FakeMessage(
+            message_id=900000000000000001,
+            channel=self.channel,
+            author_id=555555555555555555,
+            message_type=discord.MessageType.pins_add,
+            reference=SimpleNamespace(
+                message_id=target.id,
+                channel_id=self.channel.id,
+            ),
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            await self.client.on_message(notice)
+
+        self.assertEqual(notice.delete_count, 1)
+        self.assertEqual(target.delete_count, 0)
+        self.assertTrue(target.pinned)
+
+    async def test_pin_notice_for_non_bot_message_is_preserved(self):
+        target = FakeMessage(
+            message_id=900000000000000002,
+            channel=self.channel,
+            author_id=MEMBER_ID,
+            content="běžná zpráva uživatele",
+        )
+        target.pinned = True
+        self.channel._messages.append(target)
+        notice = FakeMessage(
+            message_id=900000000000000003,
+            channel=self.channel,
+            author_id=555555555555555555,
+            message_type=discord.MessageType.pins_add,
+            reference=SimpleNamespace(
+                message_id=target.id,
+                channel_id=self.channel.id,
+            ),
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            await self.client.on_message(notice)
+
+        self.assertEqual(notice.delete_count, 0)
+        self.assertEqual(target.delete_count, 0)
+
+    async def test_only_exact_pins_add_in_personal_folder_is_cleaned(self):
+        scenarios = []
+        regular_target = await self.channel.send(content="bot panel")
+        scenarios.append(
+            FakeMessage(
+                message_id=900000000000000004,
+                channel=self.channel,
+                author_id=BOT_ID,
+                message_type=discord.MessageType.default,
+                reference=SimpleNamespace(
+                    message_id=regular_target.id,
+                    channel_id=self.channel.id,
+                ),
+            )
+        )
+
+        request_channel = FakeChannel(self.guild)
+        request_channel.name = "zadost-123"
+        request_target = await request_channel.send(content="bot panel")
+        scenarios.append(
+            FakeMessage(
+                message_id=900000000000000005,
+                channel=request_channel,
+                author_id=BOT_ID,
+                message_type=discord.MessageType.pins_add,
+                reference=SimpleNamespace(
+                    message_id=request_target.id,
+                    channel_id=request_channel.id,
+                ),
+            )
+        )
+
+        unrelated_channel = FakeChannel(self.guild)
+        unrelated_channel.category_id = 777777777777777777
+        unrelated_target = await unrelated_channel.send(content="bot panel")
+        scenarios.append(
+            FakeMessage(
+                message_id=900000000000000006,
+                channel=unrelated_channel,
+                author_id=BOT_ID,
+                message_type=discord.MessageType.pins_add,
+                reference=SimpleNamespace(
+                    message_id=unrelated_target.id,
+                    channel_id=unrelated_channel.id,
+                ),
+            )
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            for notice in scenarios:
+                await self.client.on_message(notice)
+
+        self.assertTrue(all(notice.delete_count == 0 for notice in scenarios))
+
+    async def test_pin_notice_cleanup_requires_manage_messages(self):
+        channel = FakeChannel(self.guild, can_manage_messages=False)
+        target = await channel.send(content="bot panel")
+        notice = FakeMessage(
+            message_id=900000000000000007,
+            channel=channel,
+            author_id=555555555555555555,
+            message_type=discord.MessageType.pins_add,
+            reference=SimpleNamespace(
+                message_id=target.id,
+                channel_id=channel.id,
+            ),
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            await self.client.on_message(notice)
+
+        self.assertEqual(notice.delete_count, 0)
+        self.assertEqual(target.delete_count, 0)
+        self.assertEqual(self.events[-1].title, "Hlášku o připnutí nelze odstranit")
+        self.assertIn("Spravovat zprávy", self.events[-1].message)
+
+    async def test_pin_notice_cleanup_accepts_administrator_without_manage_messages(self):
+        channel = FakeChannel(self.guild, can_manage_messages=False)
+        channel.permissions_for = lambda member: SimpleNamespace(
+            administrator=True,
+            manage_messages=False,
+        )
+        target = await channel.send(content="bot panel")
+        notice = FakeMessage(
+            message_id=900000000000000008,
+            channel=channel,
+            author_id=555555555555555555,
+            message_type=discord.MessageType.pins_add,
+            reference=SimpleNamespace(
+                message_id=target.id,
+                channel_id=channel.id,
+            ),
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            await self.client.on_message(notice)
+
+        self.assertEqual(notice.delete_count, 1)
+        self.assertEqual(target.delete_count, 0)
+        self.assertEqual(self.events, [])
+
+    async def test_pin_notice_delete_errors_are_safe_and_reported(self):
+        target = await self.channel.send(content="bot panel")
+        errors = (
+            discord.Forbidden(DummyResponse(), "missing permissions"),
+            discord.HTTPException(DummyResponse(), "temporary failure"),
+        )
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            for index, error in enumerate(errors, start=1):
+                with self.subTest(error=type(error).__name__):
+                    notice = FakeMessage(
+                        message_id=900000000000000010 + index,
+                        channel=self.channel,
+                        author_id=BOT_ID,
+                        message_type=discord.MessageType.pins_add,
+                        reference=SimpleNamespace(
+                            message_id=target.id,
+                            channel_id=self.channel.id,
+                        ),
+                        delete_error=error,
+                    )
+                    await self.client.on_message(notice)
+                    self.assertEqual(notice.delete_count, 0)
+                    self.assertEqual(
+                        self.events[-1].title,
+                        "Hlášku o připnutí nelze odstranit",
+                    )
+
+        self.assertEqual(target.delete_count, 0)
+
+    async def test_historical_scan_does_not_delete_old_pin_notice(self):
+        target = await self.channel.send(content="starší bot panel")
+        old_notice = FakeMessage(
+            message_id=900000000000000020,
+            channel=self.channel,
+            author_id=BOT_ID,
+            message_type=discord.MessageType.pins_add,
+            reference=SimpleNamespace(
+                message_id=target.id,
+                channel_id=self.channel.id,
+            ),
+        )
+        self.channel._messages.append(old_notice)
+        self.client._connection._guilds[self.guild.id] = self.guild
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            updated = await self.client._scan_existing_channels()
+
+        self.assertEqual(updated, 0)
+        self.assertEqual(old_notice.delete_count, 0)
+        self.assertEqual(target.delete_count, 0)
+
+    async def test_historical_scan_finds_onboarding_marker_beyond_100_messages(self):
+        onboarding_message = await self._complete_security_onboarding()
+        command = name_command_messages(self.channel)[0]
+        self.channel._messages.remove(command)
+        for index in range(110):
+            await self.channel.send(content=f"historická provozní zpráva {index}")
+        onboarding_depth = (
+            len(self.channel._messages)
+            - 1
+            - self.channel._messages.index(onboarding_message)
+        )
+        self.assertGreater(onboarding_depth, 100)
+        self.client._connection._guilds[self.guild.id] = self.guild
+
+        with patch("ticket_renamer.bot.discord.TextChannel", FakeChannel):
+            updated = await self.client._scan_existing_channels()
+
+        commands = name_command_messages(self.channel)
+        self.assertGreaterEqual(updated, 1)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("/nameinradio A-01 F. Lakatoš", commands[0].content)
+        self.assertTrue(commands[0].pinned)
 
     async def test_only_panel_owner_can_start_and_end_shift(self):
         await self._complete_security_onboarding()

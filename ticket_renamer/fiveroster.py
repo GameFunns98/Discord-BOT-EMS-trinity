@@ -403,6 +403,9 @@ class FiveRosterClient:
     async def get_player_rank_uuid(self, member_id: int) -> str | None:
         player = await self.get_player(member_id)
 
+        return self._player_rank_uuid(player)
+
+    def _player_rank_uuid(self, player: Mapping[str, Any] | None) -> str | None:
         if player is None:
             return None
 
@@ -430,15 +433,33 @@ class FiveRosterClient:
 
         return None
 
+    @staticmethod
+    def _player_callsign(player: Mapping[str, Any] | None) -> str | None:
+        if player is None:
+            return None
+        callsign = str(player.get("callsign") or "").strip()
+        return callsign or None
+
+    async def get_player_callsign(self, member_id: int) -> str | None:
+        """Return the callsign exposed by GET players, if the field is present."""
+
+        return self._player_callsign(await self.get_player(member_id))
+
     async def is_player_enrolled(self, member_id: int) -> bool:
         player = await self.get_player(member_id)
         return player is not None
 
     async def enroll(self, member_id: int, rank_key: str) -> EnrollmentOutcome:
         rank = self.rank_for(rank_key)
-        current_rank_uuid = await self.get_player_rank_uuid(member_id)
+        current_player = await self.get_player(member_id)
+        current_rank_uuid = self._player_rank_uuid(current_player)
+        current_callsign = self._player_callsign(current_player)
         if current_rank_uuid == rank.uuid:
-            return EnrollmentOutcome(rank=rank, already_enrolled=True)
+            return EnrollmentOutcome(
+                rank=rank,
+                already_enrolled=True,
+                callsign=current_callsign,
+            )
         if current_rank_uuid:
             raise FiveRosterDifferentRankError(
                 "Uživatel už je ve FiveRosteru na jiné hodnosti; automatická změna byla zastavena."
@@ -452,8 +473,12 @@ class FiveRosterClient:
             )
         except FiveRosterError as original_error:
             try:
-                if await self.get_player_rank_uuid(member_id) == rank.uuid:
-                    return EnrollmentOutcome(rank=rank)
+                verified_player = await self.get_player(member_id)
+                if self._player_rank_uuid(verified_player) == rank.uuid:
+                    return EnrollmentOutcome(
+                        rank=rank,
+                        callsign=self._player_callsign(verified_player),
+                    )
             except FiveRosterError:
                 pass
             raise original_error
