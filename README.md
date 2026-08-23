@@ -8,7 +8,8 @@ Nový tok funguje takto:
 3. bot otevře vybraný kanál žádosti, načte formulář, přejmenuje osobní
    složku a vloží do ní embed se základními informacemi,
 4. podle pozice nabídne vedení cílovou hodnost ve FiveRosteru,
-5. po potvrzeném nástupu vloží a připne zaměstnanci osobní služební panel.
+5. po potvrzeném nástupu vloží a připne zaměstnanci herní příkaz
+   `/nameinradio` a osobní služební panel.
 
 Pokud odkaz na `zadost-*` chybí nebo není použitelný, bot místo tichého
 ukončení vloží do osobní složky ovládání **Doplnit údaje**. Člen vedení v něm
@@ -56,9 +57,22 @@ potvrzeném zápisu bot odebere Občana, přidá EMS a nakonfigurované dekorati
 role. Ostatní role zaměstnance zachová. Volbu potom uzamkne, aby nešlo nástup
 provést dvakrát.
 
-Pod ovládáním odešle také kopírovatelný návrh jména, například `F. Lakatoš`.
-FiveRoster API změnu jména nepodporuje, proto se tento poslední krok provede
-ručně.
+Po potvrzeném nástupu odešle a připne také kopírovatelný návrh jména a hotový
+herní příkaz, například:
+
+```text
+F. Lakatoš
+/nameinradio A-01 F. Lakatoš
+```
+
+Volačku načte z FiveRoster API i u zaměstnance, který už na stejné hodnosti je.
+Pokud ji API výjimečně neposkytne, zpráva bezpečně ponechá zástupný text
+`[volačka]`. FiveRoster API změnu zobrazovaného jména nepodporuje, proto se
+návrh jména nadále nastaví ručně.
+
+Když bot připne svou zprávu, odstraní v osobní složce nově vzniklé systémové
+hlášení Discordu o připnutí. Samotná připnutá zpráva ani hlášení po připnutí
+cizí zprávy se nemažou.
 
 ## Směny, kvóty a LOA
 
@@ -181,8 +195,9 @@ V [Discord Developer Portal](https://discord.com/developers/applications):
    - **Send Messages**,
    - **Embed Links**,
    - **Pin Messages**,
+   - **Manage Messages**,
    - **Manage Roles**.
-4. V kategorii osobních složek povolte prvních šest oprávnění; **Manage Roles**
+4. V kategorii osobních složek povolte prvních sedm oprávnění; **Manage Roles**
    se nastavuje na úrovni serverové role bota.
 5. V kategorii se žádostmi stačí **View Channels** a **Read Message History**.
 
@@ -237,7 +252,8 @@ oznámení `Bot je připojen` proveďte jeden zkušební tok:
 3. po odeslání se osobní složka přejmenuje například na `🚑・luis-diaz`
    a objeví se v ní základní informace, nástupová tlačítka a návrh jména,
 4. člen vedení vybere cílovou hodnost (včetně Ochrany = `Security`),
-5. po úspěšném zápisu zkontrolujte připnutý služební panel.
+5. po úspěšném zápisu zkontrolujte připnutý příkaz `/nameinradio` a služební
+   panel; pomocné systémové hlášení o připnutí má bot odstranit.
 
 Pokud vybraný kanál neexistuje, nemá prefix `zadost-`, neobsahuje formulář
 nebo bot nemá oprávnění, Windows zobrazí upozornění s důvodem. Chybějící
@@ -309,6 +325,9 @@ dokončený onboarding marker. Zaměstnance nikdy neodhaduje podle názvu kanál
   bez této role nemá výjimku.
 - Ruční `/sluzebni-panel` používá stejnou kontrolu role a funguje jen v povolené
   osobní složce. Směnu a LOA ovládá výhradně vlastník panelu podle Discord ID.
+- Automatické či ruční připnutí botovy zprávy může vytvořit systémové hlášení
+  typu `pins_add`. Bot odstraňuje pouze nové hlášení odkazující na jeho vlastní
+  zprávu v povolené osobní složce; k tomu potřebuje **Manage Messages**.
 - FiveRoster stav se před zápisem znovu ověřuje. Krátká cache a interní omezení
   drží aplikaci pod limitem 50 požadavků API za minutu.
 - Před API zápisem bot ověří existenci a pořadí Discord rolí. Pokud je už člen

@@ -97,13 +97,31 @@ class FiveRosterClientTests(unittest.IsolatedAsyncioTestCase):
         same = StubFiveRosterClient(
             [
                 (200, ranks_payload()),
-                (200, {"data": [{"id": "123", "rank_uuid": "p"}]}),
+                (
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "123",
+                                "rank_uuid": "p",
+                                "callsign": "M-12",
+                            }
+                        ]
+                    },
+                ),
             ]
         )
         await same.refresh_ranks()
         outcome = await same.enroll(123, "paramedic")
         self.assertTrue(outcome.already_enrolled)
+        self.assertEqual(outcome.callsign, "M-12")
         self.assertEqual([request[0] for request in same.requests].count("POST"), 0)
+        self.assertEqual(
+            [request[1] for request in same.requests].count(
+                "/rosters/roster/players"
+            ),
+            1,
+        )
 
         different = StubFiveRosterClient(
             [
