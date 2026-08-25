@@ -189,6 +189,7 @@ def build_manual_fallback_embed(
     descriptions = {
         ManualFallbackState.WAITING: (
             "Zdrojovou žádost se nepodařilo bezpečně načíst. "
+            "Nutné údaje: Jméno a příjmení, Datum narození, Telefonní číslo, Pozice. "
             "Tlačítko může použít pouze nakonfigurovaná role Vedení."
         ),
         ManualFallbackState.READY: (
